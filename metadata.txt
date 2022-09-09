@@ -1,0 +1,58 @@
+# This file contains metadata for your plugin.
+
+# This file should be included when you package your plugin.# Mandatory items:
+
+[general]
+name=SOI map clipper
+qgisMinimumVersion=3.0
+description=Plugin to detect and clip the map area of Survey of India (SOI) map sheets
+version=0.4
+author=Jack Tomaney
+email=jat90@cam.ac.uk
+
+about=This plugin detects and clips the map area of georeferenced Survey of India (SOI) map sheets. Clipped map sheets are saved as either a temporary file or a permanant file and then loaded as a layer.  
+
+tracker=http://bugs
+repository=http://repo
+# End of mandatory metadata
+
+# Recommended items:
+
+hasProcessingProvider=yes
+# Uncomment the following line and add your changelog:
+changelog=0.4
+    - If a vertical line is not found, plugin will change search area. This means that SOI maps that have been drawn to incorrect coordinates can be clipped
+    0.3
+    - option to select whether to mask area outside map or just clip map area
+    - user can choose 'no data' value
+    - user can select output data type 
+    - user can select output CRS
+    0.2
+    - update to use native CRS of input raster
+    - scale settings based on input map size
+    0.1
+    - initial version 
+
+# Tags are comma separated with spaces allowed
+tags=python, SOI, raster, clip
+
+homepage=http://homepage
+category=Raster
+icon=Logo.png
+# experimental flag
+experimental=True
+
+# deprecated flag (applies to the whole plugin, not just a single version)
+deprecated=False
+
+# Since QGIS 3.8, a comma separated list of plugins to be installed
+# (or upgraded) can be specified.
+# Check the documentation for more information.
+# plugin_dependencies=
+
+Category of the plugin: Raster, Vector, Database or Web
+# category=Raster
+
+# If the plugin can run on QGIS Server.
+server=False
+
