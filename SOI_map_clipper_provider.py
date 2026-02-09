@@ -67,7 +67,7 @@ class SoiMapClipperProvider(QgsProcessingProvider):
         string should be a unique, short, character only string, eg "qgis" or
         "gdal". This string should not be localised.
         """
-        return 'MAHSA tools'
+        return 'MAHSA tools SOI'
 
     def name(self):
         """
@@ -76,7 +76,7 @@ class SoiMapClipperProvider(QgsProcessingProvider):
 
         This string should be short (e.g. "Lastools") and localised.
         """
-        return self.tr('MAHSA tools')
+        return self.tr('MAHSA tools SOI')
 
     def icon(self):
         cmd_folder = os.path.split(inspect.getfile(inspect.currentframe()))[0]

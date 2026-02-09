@@ -81,6 +81,7 @@ from qgis.core import (
  QgsExpressionContext,
  QgsExpressionContextUtils,
  QgsProcessingContext,
+ QgsRasterBandStats,
  edit,
  )
 
@@ -184,22 +185,9 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         output_path_raster = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
         teststring = self.parameterAsString(parameters, self.INPUT, context)
         print(teststring)
-        #if feedback.isCanceled():
-         #   break
-        #(sink, dest_id) = self.parameterAsSink(parameters, self.OUTPUT,
-        #        context, source.fields(), source.wkbType(), source.sourceCrs())
-
-        # Compute the number of steps to display within the progress bar and
-        # get features from source
-        #total = 100.0 / source.featureCount() if source.featureCount() else 0
-        #features = source.getFeatures()
-        #rlayer = QgsRasterLayer(source)
-        # Add to map
-        #iface.addRasterLayer(source, "raster test")
-        # Check raster data type
         data_provider = rlayer.constDataProvider()
 
-        #Find CRS of raster
+        #Find CRS of raster and convert to 4326 if not already
         crs = rlayer.crs().authid()
         print(crs)
         if crs != "EPSG:4326":
@@ -212,11 +200,11 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                             })['OUTPUT']
             rlayer = QgsRasterLayer(rlayerwarp)
 
-
+        feedback.setProgress(int(10))
         # Find extent
         huh = rlayer.extent()
 
-        # Find individual coordinates of extent
+        # Find individual max/min of extent
         xmin = huh.xMinimum()
         xmax = huh.xMaximum()
         ymin = huh.yMinimum()
@@ -242,15 +230,14 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         vll.updateExtents()
 
         # Show the layer in QGIS
-        #QgsProject.instance().addMapLayer(vll)
-        #context.temporaryLayerStore().addMapLayer(vll)
-        # take 1 degree off and add one degree on to the extent (to make sure it is covered) and make grid.
+        # QgsProject.instance().addMapLayer(vll)
+        # Take 1 degree off and add one degree on to the extent (to make sure it is covered) and make grid.
         xminfl = math.floor(xmin) - 1
         xmaxfl = math.ceil(xmax) + 1
         yminfl = math.floor(ymin) - 1
         ymaxfl = math.ceil(ymax) + 1
 
-        # Make string of extents
+        # Make string of max/min coordinates
         exin = str(xminfl) + ',' + str(xmaxfl) + ',' + str(yminfl) + ',' + str(ymaxfl)
 
         # run create grid tool for 0.25 degrees
@@ -259,7 +246,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                     'CRS': 'EPSG:4326', 'OUTPUT': 'memory:'})
         #QgsProject.instance().addMapLayer(grdd['OUTPUT'])
 
-        # Select those of the grid that intersept the raster
+        # Select those of the grid that intersect the raster
         grddint = processing.run("native:selectbylocation", {'INPUT': grdd['OUTPUT'], 'PREDICATE': '0',
                                                              'INTERSECT': vll, 'METHOD': '0'})
 
@@ -269,14 +256,14 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
 
         #QgsProject.instance().addMapLayer(bufg['OUTPUT'])
         pd.options.mode.chained_assignment = None
-        # Change to pandas dataframe
+        # Change to pandas dataframe to order polygon features
         cols = [f.name() for f in bufg['OUTPUT'].fields()]
         datagen = ([f[col] for col in cols] for f in bufg['OUTPUT'].getFeatures())
         df = pd.DataFrame.from_records(data=datagen, columns=cols)
         df['row_num'] = np.arange(len(df))
         df = df.sort_values(by=['top', 'left'])
         df["order"] = np.arange(len(df))
-        # Add column and rown numbers to df
+        # Add column and row numbers to df
         df["Ycoln"] = 0
         df["Xcoln"] = 0
 
@@ -327,7 +314,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
 
         bufg['OUTPUT'].commitChanges()
 
-        # Merge columns if it isnt an even 3x3 grid
+        # Merge columns if it isnt an even 3x3 grid to make it an even 3x3 grid
         if numycol != 3 or xgrinum != 3:
             yandx = ["Ycoln", "Xcoln"]
             xandy = ["Xcoln", "Ycoln"]
@@ -359,7 +346,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                         # Dissolve new layer
                         bseldis = processing.run("native:dissolve", {'INPUT': bsel['OUTPUT'],
                                                                      'OUTPUT': 'memory:'})
-                        QgsProject.instance().addMapLayer(bseldis['OUTPUT'])
+                        #QgsProject.instance().addMapLayer(bseldis['OUTPUT'])
                         if xdr == 0:
                             idxx = bsel['OUTPUT'].fields().indexFromName('Xcoln')
                             bsmin = bsel['OUTPUT'].minimumValue(idxx)
@@ -416,7 +403,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
 
         bufg['OUTPUT'].commitChanges()
 
-        # Work out buffer distantce by selecting centre
+        # Work out buffer distance by selecting centre
         bufg['OUTPUT'].selectByExpression('"order2"=\'4\'', QgsVectorLayer.SetSelection)
 
         centbb = processing.run("native:saveselectedfeatures", {'INPUT': bufg['OUTPUT'],
@@ -437,15 +424,16 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         sidx = centbblelength['OUTPUT'].fields().indexFromName('length')
         ssmax = centbblelength['OUTPUT'].maximumValue(sidx)
 
-        # A good buffer to use is roughly 1/80th of the smallest size of the map (this therefore scales for latitude differences and map sheet size differences etc.)
+        # A good buffer to use is roughly 1/80th of the smallest size of the map
+        # (this therefore scales for latitude differences and map sheet size differences etc.)
         bufssmal = ssmax / 80
 
-        # Buffer grid
+        # Buffer grid to have a slightly overlap
         bufgs = processing.run("native:buffer", {'INPUT': bufg['OUTPUT'], 'DISTANCE': str(bufssmal),
                                                  'END_CAP_STYLE': '1', 'JOIN_STYLE': '1',
                                                  'OUTPUT': 'memory:'})
         print('buffer of ', str(bufssmal))
-
+        feedback.setProgress(int(20))
         # Select cells on edge of map sheet
         frrt = []
 
@@ -456,11 +444,8 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
 
         bufgs['OUTPUT'].dataProvider().deleteFeatures(frrt)
 
-        # Select overlapping grid square
         # Select centre
         bufgs['OUTPUT'].selectByExpression('"order2"=\'4\'', QgsVectorLayer.SetSelection)
-
-        cent_selection = bufgs['OUTPUT'].selectedFeatures()
 
         cent = processing.run("native:saveselectedfeatures", {'INPUT': bufgs['OUTPUT'],
                                                               'OUTPUT': 'memory:'
@@ -468,7 +453,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
 
         #QgsProject.instance().addMapLayer(cent['OUTPUT'])
 
-        # What to use as quantile for map
+        # What to use as percentile and length for finding lines
         quanyy = self.parameterAsInt(parameters, self.LINEQUAL, context)
         if quanyy == 2:
             quantty = 20
@@ -488,14 +473,15 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         lname = ['bottom', 'left', 'right', 'top']  # Which side?
         lpordco = ['x', 'y', 'y', 'x']  # x or y axis
         xyangll = [90, 180, 180, 90]  # Rough angle lines should be travelling in
-        angpoin = [90, 0, 0, 90]  # Angle that points are facing
-        ritnum = 0
-
+        angpoin = [90, 0, 0, 90]  # Rough angle that points are facing
+        ritnum = 0 #
+        feedback.setProgress(int(30))
+        # Loop for all sides of the map to find the border lines
         for it in range(len(lpvar)):
             #
             ssid = '"order2"=\'' + str(lpvar[it]) + '\''
             #
-            # select other
+            # Expression to select the side
             bufgs['OUTPUT'].selectByExpression(ssid, QgsVectorLayer.SetSelection)
             #
             side = processing.run("native:saveselectedfeatures", {'INPUT': bufgs['OUTPUT'],
@@ -504,7 +490,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
             #
             # QgsProject.instance().addMapLayer(side['OUTPUT'])
             #
-            # intersect
+            # intersect of centre and side polygons
             intersere = processing.run("native:intersection", {'INPUT': cent['OUTPUT'],
                                                              'OVERLAY': side['OUTPUT'],
                                                              'OUTPUT': 'memory:'
@@ -513,7 +499,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
             # QgsProject.instance().addMapLayer(intersere['OUTPUT'])
             # If the left side was moved due to not being in the correct place, then move the right too
             if ritnum != 0 and lpordco[it] == 'y':
-                # how far has it moved?
+                # how far has it moved? (+1 to make sure)
                 moo = (intersere.extent().xMaximum() - intersere.extent().xMinimum()) * (ritnum + 1)
                 # Change x coords
                 newxmax = intersere.extent().xMaximum() - moo
@@ -542,7 +528,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 prrectt.addFeature(frectt)
                 vll5.updateExtents()
                 #
-                QgsProject.instance().addMapLayer(vll5)
+                #QgsProject.instance().addMapLayer(vll5)
                 intersere = vll5
             ritnum = 0
             # While loop (incase it is focused on wrong part of raster)
@@ -568,7 +554,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                         newymin = intersere.extent().yMinimum()
                         newymax = intersere.extent().yMaximum()
                     #
-                    print("hello")
+                    print(ritnum)
                     # Create new polygon
                     vll4 = QgsVectorLayer("Polygon", "temp", "memory")
                     #
@@ -591,7 +577,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                     prrectt.addFeature(frectt)
                     vll4.updateExtents()
                     #
-                    QgsProject.instance().addMapLayer(vll4)
+                    #QgsProject.instance().addMapLayer(vll4)
                     intersere = vll4
                 repnum = 1
                 # Clip raster by intersection
@@ -602,8 +588,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                     'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
                                                                     })['OUTPUT']
                 result = QgsRasterLayer(result)
-                # New quantiles
-                # Random points in extent
+                # Find 5000 random points in extent
                 quanpoints = processing.run('native:randompointsinextent', {'EXTENT': intersere,
                                                                             'MAX_ATTEMPTS': 200,
                                                                             'MIN_DISTANCE': 0,
@@ -611,13 +596,13 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                             'POINTS_NUMBER': 5000,
                                                                             'TARGET_CRS': vll.crs(),
                                                                             })['OUTPUT']
-                # Find pixel values of the points
+                # Find pixel values of these points to be used to calculate percentile value
                 quanpointssam = processing.run('native:rastersampling', {'INPUT': quanpoints,
                                                                          'RASTERCOPY': result,
                                                                          'COLUMN_PREFIX': 'BAND_',
                                                                          'OUTPUT': 'TEMPORARY_OUTPUT',
                                                                          })['OUTPUT']
-                #
+                # Make individual inputs of each raster band
                 # band1
                 rasba1 = processing.run('gdal:translate', {'COPY_SUBDATASETS': False,
                                                            'DATA_TYPE': 0,
@@ -632,7 +617,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 #
                 rasb1 = QgsRasterCalculatorEntry()
                 rasb1.ref = 'rasout@1'
-                rasb1.raster = rasb1result  # rlayer
+                rasb1.raster = rasb1result
                 rasb1.bandNumber = 1
                 entries.append(rasb1)
                 # iface.addRasterLayer(rasba1)
@@ -648,8 +633,8 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 rasb2result = QgsRasterLayer(rasba2)
                 rasb2 = QgsRasterCalculatorEntry()
                 rasb2.ref = 'rasout@2'
-                rasb2.raster = rasb2result  # rlayer
-                rasb2.bandNumber = 1  # 2
+                rasb2.raster = rasb2result
+                rasb2.bandNumber = 1
                 entries.append(rasb2)
                 # iface.addRasterLayer(rasba2)
                 # band3
@@ -664,21 +649,21 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 rasb3result = QgsRasterLayer(rasba3)
                 rasb3 = QgsRasterCalculatorEntry()
                 rasb3.ref = 'rasout@3'
-                rasb3.raster = rasb3result  # rlayer
-                rasb3.bandNumber = 1  # 3
+                rasb3.raster = rasb3result
+                rasb3.bandNumber = 1
                 entries.append(rasb3)
                 # iface.addRasterLayer(rasba3)
-                # Add rasters together
+                # Add raster bands together
                 rasbanall = QgsProcessingUtils.generateTempFilename('rasbanall.tif')
                 #
                 calc = QgsRasterCalculator('rasout@1 + rasout@2 + rasout@3', rasbanall, 'GTiff', result.extent(),
                                            result.width(),
                                            result.height(), entries)
                 calc.processCalculation()
-                iface.addRasterLayer(rasbanall)
+                #iface.addRasterLayer(rasbanall)
                 rasoutall = QgsRasterLayer(rasbanall)
                 #
-                # Find quantile of the middle section of raster filtering out blank values
+                # Find percentile of the middle section of raster filtering out blank values
                 stats = rasoutall.dataProvider().bandStatistics(1, QgsRasterBandStats.All)
                 dataquanpoints1 = list(
                     filter(None, [f['BAND_1'] for f in quanpointssam.getFeatures()]))  # List all values in column
@@ -686,13 +671,13 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                     filter(None, [f['BAND_2'] for f in quanpointssam.getFeatures()]))  # List all values in column
                 dataquanpoints3 = list(
                     filter(None, [f['BAND_3'] for f in quanpointssam.getFeatures()]))  # List all values in column
-                # loop for 10th percentile
+                # loop for percentile value determined by line quality
                 for p in [quantty]:
                     rasbanallquan = round((np.percentile(dataquanpoints1, p)) + (np.percentile(dataquanpoints2, p)) \
                                           + (np.percentile(dataquanpoints3, p)))
                     print(rasbanallquan)
                 #
-                # Reclassify full raster using the percentile value
+                # Reclassify full raster using the percentile value into 0 (not possible line) and 1 (possible line)
                 rasoutreclass = processing.run('native:reclassifybytable', {'DATA_TYPE': 0,
                                                                             'INPUT_RASTER': rasoutall,
                                                                             'NODATA_FOR_MISSING': False,
@@ -706,27 +691,27 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                                       '1'],
                                                                             })['OUTPUT']
                 #
-                iface.addRasterLayer(rasoutreclass)
+                #iface.addRasterLayer(rasoutreclass)
+                # Sieve reclassified raster to remove any isolate small areas of pixels
                 rastest2 = processing.run('gdal:sieve', {'INPUT': rasoutreclass,
                                                          'THRESHOLD:': 40,
                                                          'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT})['OUTPUT']
-                iface.addRasterLayer(rastest2)
-                # Make a shapefile and vectorise raster
+                #iface.addRasterLayer(rastest2)
+                # Make a shapefile and vectorise raster as contours
                 tpol = QgsProcessingUtils.generateTempFilename('tpollo.shp')
                 polre = processing.run('gdal:contour', {'INPUT': rastest2, 'BAND': 1, 'INTERVAL': 1, 'OUTPUT': tpol})[
                     'OUTPUT']
-                # polre = processing.run('gdal:polygonize', {'INPUT':rastest, 'BAND':1, 'FIELD':'DN',  'OUTPUT': tpol})['OUTPUT']
                 polrev = QgsVectorLayer(polre, 'vec', 'ogr')
                 # QgsProject.instance().addMapLayer(polrev)
                 #
-                # Reproject to 3857
+                # Reproject to 3857 so that simplification can be calulated in metres
                 plinesrep = processing.run("native:reprojectlayer", {'INPUT': polrev,
                                                                      'TARGET_CRS': 'EPSG:3857',
                                                                      'OUTPUT': 'memory:'})
                 #
                 # QgsProject.instance().addMapLayer(plinesrep['OUTPUT'])
                 #
-                # Simplify to 20 metres
+                # Simplify contour lines to 20 metres
                 plinessimp = processing.run("native:simplifygeometries", {'INPUT': plinesrep['OUTPUT'],
                                                                           'METHOD': '0',
                                                                           'TOLERANCE': '20',
@@ -738,36 +723,39 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                     'OUTPUT': 'memory:'})
                 #
                 # QgsProject.instance().addMapLayer(plinesexpO['OUTPUT'])
-                # Calculate length of features
+                # Calculate length of the exploded features
                 newlength = processing.run("qgis:exportaddgeometrycolumns", {'INPUT': plinesexpO['OUTPUT'],
                                                                              'CALC_METHOD': 2,
                                                                              'OUTPUT': 'memory:'
                                                                              })
-                # Find the minimum length a line should be to qualify (starting at 1/27th the lenght of the intersect box)
+                # Find the minimum length a line should be to qualify as possible border line using the length of the
+                # longest intersect line
                 interserepl = processing.run("native:polygonstolines", {'INPUT': intersere,
                                                                         'OUTPUT': 'memory:'
                                                                         })
                 intersereple = processing.run("native:explodelines", {'INPUT': interserepl['OUTPUT'],
                                                                       'OUTPUT': 'memory:'})
-                # Calculate length of lines and find longest
+                # Calculate length of intersect lines and find longest
                 intersereplelength = processing.run("qgis:exportaddgeometrycolumns", {'INPUT': intersereple['OUTPUT'],
                                                                                       'CALC_METHOD': 2,
                                                                                       'OUTPUT': 'memory:'
                                                                                       })
                 insidx = intersereplelength['OUTPUT'].fields().indexFromName('length')
+                # Find starting minimum length value
                 inssmax = (intersereplelength['OUTPUT'].maximumValue(insidx)) / lengthrr
                 #
-                # Find absolute minimum length a line should be
+                # Find absolute minimum length value
                 absmin = inssmax / 1.5
                 # QgsProject.instance().addMapLayer(newlength['OUTPUT'])
-                # Select only features greater than specified length
+                # Select only features greater than the specified length
                 lendist = '"length" > ' + str(round(inssmax))
                 newlength['OUTPUT'].selectByExpression(lendist, QgsVectorLayer.SetSelection)
                 #
                 plinesexp_1000_selec = processing.run("native:saveselectedfeatures", {'INPUT': newlength['OUTPUT'],
                                                                                       'OUTPUT': 'memory:'
                                                                                       })
-                # There should be at least four lines, so if there is not, lower the maximum length required by 50 untill there are
+                # There should be at least three lines, so if there is not, lower the maximum length required
+                # (up to the absolute minimum value) untill there are
                 numoffeat = plinesexp_1000_selec['OUTPUT'].featureCount()
                 qlen = 0
                 inssmaxsec = round((inssmax / 25))
@@ -787,7 +775,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                     numoffeat = plinesexp_1000_selec['OUTPUT'].featureCount()
                     print('number of features = ', numoffeat)
                 #
-                # Line should be at least 20% of the length, or they are probably not real
+                # Lines should be at least 20% of the length of the intersect, or they are probably not real
                 plinesexp_1000_seleclength = processing.run("qgis:exportaddgeometrycolumns",
                                                             {'INPUT': plinesexp_1000_selec['OUTPUT'],
                                                              'CALC_METHOD': 2,
@@ -795,12 +783,12 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                              })
                 # Sum length of lines
                 sumllpl = sum(filter(None, [f['length'] for f in plinesexp_1000_seleclength['OUTPUT'].getFeatures()]))
-                # If the sum length of lines is not more than a fifth of the search area then it should not be considered
+                # If the sum length of lines is not more than 20% of the search area then it should not be considered
                 if sumllpl < intersereplelength['OUTPUT'].maximumValue(insidx) / 5:
                     finfeat = 0
                     continue
                 # QgsProject.instance().addMapLayer(plinesexp_1000_selec['OUTPUT'])
-                # Calculate bearing of features
+                # Calculate bearing of features so to remove lines that arent going in roughly the right direction
                 layer_provider = plinesexp_1000_selec['OUTPUT'].dataProvider()
                 layer_provider.addAttributes([QgsField('angle', QVariant.Double)])
                 #
@@ -808,13 +796,13 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 print(plinesexp_1000_selec['OUTPUT'].fields().names())
                 #
                 expression1 = QgsExpression('degrees(azimuth(start_point($geometry), end_point($geometry)))')
-                context = QgsExpressionContext()
-                context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(plinesexp_1000_selec['OUTPUT']))
+                context2 = QgsExpressionContext()
+                context2.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(plinesexp_1000_selec['OUTPUT']))
                 #
                 with edit(plinesexp_1000_selec['OUTPUT']):
                     for f in plinesexp_1000_selec['OUTPUT'].getFeatures():
-                        context.setFeature(f)
-                        f['angle'] = expression1.evaluate(context)
+                        context2.setFeature(f)
+                        f['angle'] = expression1.evaluate(context2)
                         plinesexp_1000_selec['OUTPUT'].updateFeature(f)
                 #
                 # QgsProject.instance().addMapLayer(plinesexp_1000_selec['OUTPUT'])
@@ -833,14 +821,12 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 #
                 plinesexp_1000_selec['OUTPUT'].selectByExpression(angexp, QgsVectorLayer.SetSelection)
                 #
-                plinesexp_ang = plinesexp_1000_selec['OUTPUT'].selectedFeatures()
-                #
                 plinesexp_ang_selec = processing.run("native:saveselectedfeatures",
                                                      {'INPUT': plinesexp_1000_selec['OUTPUT'],
                                                       'OUTPUT': 'memory:'
                                                       })
-                # QgsProject.instance().addMapLayer(plinesexp_ang_selec['OUTPUT'])
-                # How many lines are there in this layer?
+                #QgsProject.instance().addMapLayer(plinesexp_ang_selec['OUTPUT'])
+                # How many lines are there in this layer? If none then continue loop
                 finfeat = plinesexp_ang_selec['OUTPUT'].featureCount()
                 if finfeat == 0:
                     continue
@@ -850,7 +836,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                           'POINTS_NUMBER': '5',
                                                                           'OUTPUT': 'memory:'})
                 #
-                # QgsProject.instance().addMapLayer(randpoint['OUTPUT'])
+                #QgsProject.instance().addMapLayer(randpoint['OUTPUT'])
                 #
                 # Add coordinates to line
                 layer_provider = randpoint['OUTPUT'].dataProvider()
@@ -862,16 +848,16 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 xory = '$' + lpordco[it]
                 #
                 expression1 = QgsExpression(xory)
-                context = QgsExpressionContext()
-                context.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(randpoint['OUTPUT']))
+                context2 = QgsExpressionContext()
+                context2.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(randpoint['OUTPUT']))
                 #
                 with edit(randpoint['OUTPUT']):
                     for f in randpoint['OUTPUT'].getFeatures():
-                        context.setFeature(f)
-                        f['coord'] = round(expression1.evaluate(context), 2)
+                        context2.setFeature(f)
+                        f['coord'] = round(expression1.evaluate(context2), 2)
                         randpoint['OUTPUT'].updateFeature(f)
                 #
-                # Join points together with line using coordinates
+                # Join random points together with line using coordinates to make sure they are in correct order
                 # First check QGIS version (as it is slightly different between 3.16 and 3.22
                 if float(Qgis.QGIS_VERSION[0:4]) < 3.2:
                     ordins = 'ORDER_FIELD'
@@ -885,13 +871,13 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 #
                 # QgsProject.instance().addMapLayer(linepoi['OUTPUT'])
                 #
-                # Simplify by 20 metres
+                # Simplify line by 20 metres
                 linepoisimp = processing.run("native:simplifygeometries", {'INPUT': linepoi['OUTPUT'],
                                                                            'METHOD': '0',
                                                                            'TOLERANCE': '20',
                                                                            'OUTPUT': 'memory:'})
-                QgsProject.instance().addMapLayer(linepoisimp['OUTPUT'])
-                # Extend lines
+                #QgsProject.instance().addMapLayer(linepoisimp['OUTPUT'])
+                # Extend line so it definitly covers all of the map length
                 linepexte = processing.run("native:extendlines", {'INPUT': linepoisimp['OUTPUT'],
                                                                   'START_DISTANCE': str(
                                                                       intersereplelength['OUTPUT'].maximumValue(
@@ -900,11 +886,10 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                       intersereplelength['OUTPUT'].maximumValue(
                                                                           insidx)),
                                                                   'OUTPUT': 'memory:'})
-                # Check angle of points, if too high then rerun simplification.
+                # Check angle of points, if too high then rerun simplification to straighten line more
                 angcheck = processing.run("native:extractvertices", {'INPUT': linepexte['OUTPUT'],
                                                                      'OUTPUT': 'memory:'})
                 #
-                aaan = 0
                 tol = 20
                 # Change angles if they are around 360
                 if lpvar[it] == 3 or lpvar[it] == 5:
@@ -954,6 +939,8 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                     print(finang)
                     if finang == 2:
                         break
+
+                # If there are no features then exit the iteration
                 if minang <= angpoin[it] - 5 or maxang >= angpoin[it] + 5:
                     finfeat = 0
                     continue
@@ -965,7 +952,8 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                                      })
                 # Sum length of lines
                 sumll = sum(filter(None, [f['length'] for f in linepoisimplength['OUTPUT'].getFeatures()]))
-                # If the sum length of lines is not more than a third of the search area then it should not be considered
+                # If the sum length of lines is not more than a third of the search area
+                # then it should not be considered and exit the iteration
                 if sumll < intersereplelength['OUTPUT'].maximumValue(insidx) / 3:
                     finfeat = 0
                     continue
@@ -973,22 +961,35 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 # repeat number if necessary
                 repnum = 1
             #
-            # If first line
+            # If first line of loop then add to finalline polygon
             if it == 0:
                 finalline = linepexte['OUTPUT']
-            else:  # if other line
+            else:  # If other line then merge this line to already created final line
                 laylis = [finalline, linepexte['OUTPUT']]
                 finalline2 = processing.run("native:mergevectorlayers", {'LAYERS': laylis,
                                                                          'OUTPUT': 'memory:'})
                 finalline = finalline2['OUTPUT']
 
+            if it == 0:
+                feedback.setProgress(int(40))
+                feedback.pushInfo(self.tr('Side 1 of 4 calculated.'))
+            if it == 1:
+                feedback.setProgress(int(50))
+                feedback.pushInfo(self.tr('Side 2 of 4 calculated.'))
+            if it == 2:
+                feedback.setProgress(int(60))
+                feedback.pushInfo(self.tr('Side 3 of 4 calculated.'))
+            if it == 3:
+                feedback.setProgress(int(70))
+                feedback.pushInfo(self.tr('Side 4 of 4 calculated.'))
+
         #QgsProject.instance().addMapLayer(finalline)
 
-        # Change line to polygon
+        # Change line features to polygon
         polyout = processing.run("qgis:polygonize", {'INPUT': finalline,
                                                      'OUTPUT': 'memory:'})
-
-        #IF there is a target CRS then set the output CRS to be it
+        #QgsProject.instance().addMapLayer(polyout['OUTPUT'])
+        # If there is a target CRS specified then set the output CRS to be it
         targetCrs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
         if targetCrs.isValid():
             crs = targetCrs
@@ -1003,24 +1004,24 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
             rlayer = QgsRasterLayer(rlayerwarp)
 
 
-        # Convert polygon to 4326
+        # Convert polygon to output crs
         nativcrs = processing.run("native:reprojectlayer", {'INPUT': polyout['OUTPUT'],
                                                             'TARGET_CRS': crs,
                                                             'OUTPUT': 'memory:'})
         #
         #QgsProject.instance().addMapLayer(nativcrs['OUTPUT'])
         #
-        #If there is a target CRS, convert
-        #No data value
+        # Set no data value
         if self.NODATA in parameters and parameters[self.NODATA] is not None:
             nodata = self.parameterAsDouble(parameters, self.NODATA, context)
         else:
             nodata = None
-        #Which data type
+        # Which data type should the output be?
         dtyy = self.parameterAsInt(parameters, self.DATA_TYPE, context)
-        #Mask or clip
+        # Mask or clip?
         BOOLEAN1 = self.parameterAsBool(parameters, self.MASK, context)
-        #If true, then clip and mask. Else just clip and not mask
+        feedback.setProgress(int(85))
+        # If true, then clip and mask. Else just clip and not mask
         if BOOLEAN1 == True:
         # Mask and crop map sheet
             result = processing.run('gdal:cliprasterbymasklayer', {'INPUT': rlayer,
@@ -1033,7 +1034,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                    'OUTPUT': output_path_raster},
                                     is_child_algorithm=True,
                                     context=context,
-                                    feedback=feedback
+                                    #feedback=feedback
                                     )['OUTPUT']
         else:
             result = processing.run('gdal:cliprasterbyextent', {'INPUT': rlayer,
@@ -1042,9 +1043,9 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                    'OUTPUT': output_path_raster},
                                     is_child_algorithm=True,
                                     context=context,
-                                    feedback=feedback
+                                    #feedback=feedback
                                     )['OUTPUT']
-        #
+        # If there is a result the indicate that clipping has been successful
         try:
            result
         except NameError:
@@ -1055,6 +1056,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                 "Success - Your map has been clipped!",
                 level=Qgis.Success, duration=3)
         #
+        feedback.setProgress(int(100))
 
         #for current, feature in enumerate(features):
             # Stop the algorithm if cancel button has been clicked

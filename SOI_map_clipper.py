@@ -75,4 +75,4 @@ class SoiMapClipperPlugin(object):
         self.iface.removeToolBarIcon(self.action)
 
     def run(self):
-        processing.execAlgorithmDialog("MAHSA tools:SOI map clipper")
+        processing.execAlgorithmDialog("MAHSA tools SOI:SOI map clipper")

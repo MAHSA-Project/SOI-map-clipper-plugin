@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/SOI-map-clipper-plugin.iml" filepath="$PROJECT_DIR$/.idea/SOI-map-clipper-plugin.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/soi_map_clipper.iml" filepath="$PROJECT_DIR$/.idea/soi_map_clipper.iml" />
     </modules>
   </component>
 </project>
