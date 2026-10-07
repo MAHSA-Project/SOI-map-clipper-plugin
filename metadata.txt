@@ -6,7 +6,7 @@
 name=SOI map clipper
 qgisMinimumVersion=3.0
 description=Plugin to detect and clip the map area of Survey of India (SOI) map sheets
-version=0.4
+version=0.6
 author=Jack Tomaney
 email=jat90@cam.ac.uk
 
@@ -20,7 +20,19 @@ repository=http://repo
 
 hasProcessingProvider=yes
 # Uncomment the following line and add your changelog:
-changelog=0.4
+changelog=0.6
+    - Updated to work with QGIS 3.44.
+    - Addition to remote rasters (e.g. from COG or STAC).
+    - Added debugging option in code, to load key parts of the process if necessary.
+    - Improved auto line quality checker. Now as dynamic values calculated from pixel standard deviation for pixel quantile value and line length, rather than a choice of 4 static values.
+    - Option to not always load clipped map after clipping.	 
+    0.52
+    Bug fixes including providing temporary short file names for long tiff files, changed values for auto detection of line quality.
+    0.51
+    - Updated to work with QGIS 3.44
+    0.5
+    - New auto details option added. It will automatically assess the complexity of the map and choose what settings to search for the border lines based on this.
+    0.4
     - If a vertical line is not found, plugin will change search area. This means that SOI maps that have been drawn to incorrect coordinates can be clipped
     0.3
     - option to select whether to mask area outside map or just clip map area

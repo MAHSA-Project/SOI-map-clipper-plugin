@@ -28,82 +28,75 @@ __copyright__ = '(C) 2022 by Jack Tomaney'
 
 # This will get replaced with a git SHA1 when you do a git archive
 
-__revision__ = '$Format:%H$'
+__revision__ = "$Format:%H$"
 
-import os
 import inspect
+import math
+import os
+import shutil
+import tempfile
 
-from qgis.PyQt.QtCore import QCoreApplication, QSettings, QTranslator, QCoreApplication, QVariant
-from qgis.core import (QgsProcessing,
-                       QgsFeatureSink,
-                       QgsProcessingAlgorithm,
-                       QgsProcessingParameterFeatureSource,
-                       QgsProcessingParameterFeatureSink,
-                       QgsProcessingParameterRasterLayer,
-                       QgsProcessingParameterFileDestination,
-                       QgsProcessingParameterString,
-                       QgsProcessingParameterNumber,
-                       QgsProcessingParameterEnum,
-                       QgsProcessingParameterBoolean,
-                       QgsProcessingParameterDefinition,
-                       QgsProcessingParameterCrs,
-                       QgsProject)
+import numpy as np
+import pandas as pd
+from osgeo import gdal
 
+# PyQt imports
+from qgis.PyQt.QtCore import QCoreApplication, QSettings, QTranslator, QVariant
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QFileDialog
 
-# Import the code for the dialog
-import os.path
-import math
-import pandas as pd
+# QGIS processing import
 from qgis import processing
-import numpy as np
-from osgeo import gdal
-import tempfile
-from qgis.core import Qgis
-from qgis.core import (
- QgsRasterLayer,
- QgsProject,
- QgsPointXY,
- QgsRaster,
- QgsRasterShader,
- QgsColorRampShader,
- QgsSingleBandPseudoColorRenderer,
- QgsSingleBandColorDataRenderer,
- QgsSingleBandGrayRenderer,
- QgsVectorLayer,
- QgsField,
- QgsFeature,
- QgsGeometry,
- QgsProcessingUtils,
- QgsProcessing,
- QgsExpression,
- QgsExpressionContext,
- QgsExpressionContextUtils,
- QgsProcessingContext,
- QgsRasterBandStats,
- edit,
- )
 
-from qgis.utils import iface
-from qgis.analysis import (
-    QgsRasterCalculator,
-    QgsRasterCalculatorEntry,
+# QGIS Core imports
+from qgis.core import (
+    Qgis,
+    QgsCoordinateReferenceSystem,
+    QgsColorRampShader,
+    QgsDistanceArea,
+    QgsExpression,
+    QgsExpressionContext,
+    QgsExpressionContextUtils,
+    QgsFeature,
+    QgsFeatureRequest,
+    QgsFeatureSink,
+    QgsField,
+    QgsGeometry,
+    QgsPointXY,
+    QgsProcessing,
+    QgsProcessingAlgorithm,
+    QgsProcessingContext,
+    QgsProcessingException,
+    QgsProcessingParameterBoolean,
+    QgsProcessingParameterCrs,
+    QgsProcessingParameterDefinition,
+    QgsProcessingParameterEnum,
+    QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterFeatureSource,
+    QgsProcessingParameterFileDestination,
+    QgsProcessingParameterNumber,
+    QgsProcessingParameterRasterLayer,
+    QgsProcessingParameterString,
+    QgsProcessingUtils,
+    QgsProject,
+    QgsRaster,
+    QgsRasterBandStats,
+    QgsRasterFileWriter,
+    QgsRasterLayer,
+    QgsRasterShader,
+    QgsRectangle,
+    QgsSingleBandColorDataRenderer,
+    QgsSingleBandGrayRenderer,
+    QgsSingleBandPseudoColorRenderer,
+    QgsVectorLayer,
+    edit,
 )
 
+# QGIS Analysis & Utils
+from qgis.analysis import QgsRasterCalculator, QgsRasterCalculatorEntry
+from qgis.utils import iface
+
 class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
-    """
-    This is an example algorithm that takes a vector layer and
-    creates a new identical one.
-
-    It is meant to be used as an example of how to create your own
-    algorithms and explain methods and variables used to do it. An
-    algorithm like this will be available in all elements, and there
-    is not need for additional work.
-
-    All Processing algorithms should extend the QgsProcessingAlgorithm
-    class.
-    """
 
     # Constants used to refer to parameters and outputs. They will be
     # used when calling the algorithm from another algorithm, or when
@@ -116,6 +109,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
     DATA_TYPE = 'DATA_TYPE'
     NODATA = 'NODATA'
     TARGET_CRS = 'TARGET_CRS'
+    LOAD_OUTPUT = 'LOAD_OUTPUT'
 
     #Add this in if you want to view different stages of the process in QGIS
     def flags(self):
@@ -142,9 +136,9 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterEnum(
                 self.LINEQUAL,
-                self.tr('Quality of map area border line (only change to high or low if you are not happy with the result when using medium)'),
-                options=[('High'), ('Medium'), ('Low')],
-                defaultValue=1,))
+                self.tr('Quality of map area border line (always start with Auto, then manually select if you are not happy with the output)'),
+                options=[('Very High'), ('High'), ('Medium'), ('Low'), ('Very Low'), ('Auto')],
+                defaultValue=5,))
         #Input for masking pixels
         self.addParameter(
             QgsProcessingParameterBoolean(self.MASK,
@@ -164,14 +158,53 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                     defaultValue=0)
         dataType_param.setFlags(dataType_param.flags() | QgsProcessingParameterDefinition.FlagAdvanced)
         self.addParameter(dataType_param)
+
+        # Checkbox: Load temporary file output
+        # Defines self.LOAD_OUTPUT parameter key (make sure to define self.LOAD_OUTPUT = 'LOAD_OUTPUT' in your class)
+        self.addParameter(
+            QgsProcessingParameterBoolean(
+                "LOAD_OUTPUT",
+                self.tr("Open output file after running algorithm"),
+                defaultValue=True,  # Checked by default
+            )
+        )
+
         # Output features source - a raster geotiff
         self.addParameter(
             QgsProcessingParameterFileDestination(
                 self.OUTPUT,
                 self.tr('Output clipped raster'),
                 'GeoTIFF (*.tif *.tiff *.TIF *.TIFF)',
+                optional=True,
             )
         )
+
+    def get_metric_lengths(self, layer):
+        """
+        Returns a copy of `layer`, back in the same CRS it came in as,
+        with a 'length' field computed in true metres via a disposable
+        Web Mercator round trip. Uses native processing algorithms only
+        (no per-feature Python loop) for speed.
+        """
+        reproj = processing.run("native:reprojectlayer", {
+            'INPUT': layer,
+            'TARGET_CRS': 'EPSG:3857',
+            'OUTPUT': 'memory:'
+        })['OUTPUT']
+
+        metric = processing.run("qgis:exportaddgeometrycolumns", {
+            'INPUT': reproj,
+            'CALC_METHOD': 0,  # 3857 units are already metres, so plain Cartesian length is correct here
+            'OUTPUT': 'memory:'
+        })['OUTPUT']
+
+        back = processing.run("native:reprojectlayer", {
+            'INPUT': metric,
+            'TARGET_CRS': 'EPSG:4326',
+            'OUTPUT': 'memory:'
+        })['OUTPUT']
+
+        return back
 
     def processAlgorithm(self, parameters, context, feedback):
         """
@@ -182,10 +215,85 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         # to uniquely identify the feature sink, and must be included in the
         # dictionary returned by the processAlgorithm function.
         rlayer = self.parameterAsRasterLayer(parameters, self.INPUT, context)
+        original_layer_name = rlayer.name()  # capture before rlayer gets reassigned below
         output_path_raster = self.parameterAsOutputLayer(parameters, self.OUTPUT, context)
         teststring = self.parameterAsString(parameters, self.INPUT, context)
+        load_output = self.parameterAsBoolean(parameters, self.LOAD_OUTPUT, context)
+
+        # Load working layers (if you want to debug or view how the lines are made through added layers enter "yes")
+        debug_layers_add = "no"
+
+        # --- TEMP COPY WORKAROUND ---
+        # Local TIFFs are copied using shutil.
+        # Remote /vsicurl/ rasters (e.g. COGs from STAC) are copied using GDAL,
+        # because /vsicurl/ is a GDAL virtual filesystem path, not a Windows file path.
+
+        if rlayer and rlayer.isValid():
+
+            original_path = rlayer.source()
+
+            # Generate a temporary local TIFF
+            short_temp_path = QgsProcessingUtils.generateTempFilename("input_tmp.tif")
+
+            try:
+
+                if original_path.startswith("/vsicurl/"):
+
+                    feedback.pushInfo(
+                        "Remote /vsicurl/ raster detected. Creating local temporary copy with GDAL..."
+                    )
+
+                    # Use GDAL to read the remote COG and create a local GeoTIFF.
+                    result = gdal.Translate(
+                        short_temp_path,
+                        original_path,
+                        format="GTiff"
+                    )
+
+                    if result is None:
+                        raise QgsProcessingException(
+                            "GDAL could not create a local copy of the remote COG."
+                        )
+
+                    # Close the GDAL dataset so the file is fully written
+                    result = None
+
+                else:
+
+                    # Normal local raster: retain the existing behaviour
+                    src_path_long = (
+                        f"\\\\?\\{os.path.abspath(original_path)}"
+                        if os.name == "nt"
+                           and not os.path.abspath(original_path).startswith("\\\\?\\")
+                        else os.path.abspath(original_path)
+                    )
+
+                    shutil.copyfile(src_path_long, short_temp_path)
+
+                # Re-open the temporary local copy as the raster used by the algorithm
+                rlayer = QgsRasterLayer(short_temp_path, rlayer.name(), "gdal")
+
+                if not rlayer.isValid():
+                    raise QgsProcessingException(
+                        f"Failed to load temporary raster copy: {short_temp_path}"
+                    )
+
+                feedback.pushInfo(
+                    f"Successfully created local temporary copy: {short_temp_path}"
+                )
+
+            except Exception as e:
+                raise QgsProcessingException(
+                    f"Error creating temporary copy of raster file: {str(e)}"
+                )
         print(teststring)
         data_provider = rlayer.constDataProvider()
+
+
+
+        # New: confirm band count and validity at the very start
+        feedback.pushInfo(
+            f'Input raster: bandCount={rlayer.bandCount()}, valid={rlayer.isValid()}, dataType={rlayer.dataProvider().dataType(1)}')
 
         #Find CRS of raster and convert to 4326 if not already
         crs = rlayer.crs().authid()
@@ -200,10 +308,11 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                             })['OUTPUT']
             rlayer = QgsRasterLayer(rlayerwarp)
 
+        #QgsProject.instance().addMapLayer(rlayer)
         feedback.setProgress(int(10))
         # Find extent
         huh = rlayer.extent()
-
+        print(huh)
         # Find individual max/min of extent
         xmin = huh.xMinimum()
         xmax = huh.xMaximum()
@@ -244,7 +353,9 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         grdd = processing.run("native:creategrid", {'TYPE': '2', 'EXTENT': exin, 'HSPACING': '0.25',
                                                     'VSPACING': '0.25', 'HOVERLAY': '0', 'VOVERLAY': '0',
                                                     'CRS': 'EPSG:4326', 'OUTPUT': 'memory:'})
-        #QgsProject.instance().addMapLayer(grdd['OUTPUT'])
+        if debug_layers_add == "yes":
+            grdd['OUTPUT'].setName("DEBUG_full_grid")
+            QgsProject.instance().addMapLayer(grdd['OUTPUT'])
 
         # Select those of the grid that intersect the raster
         grddint = processing.run("native:selectbylocation", {'INPUT': grdd['OUTPUT'], 'PREDICATE': '0',
@@ -253,8 +364,10 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         bufg = processing.run("native:saveselectedfeatures", {'INPUT': grddint['OUTPUT'],
                                                                'OUTPUT': 'memory:'
                                                                })
-
-        #QgsProject.instance().addMapLayer(bufg['OUTPUT'])
+        if debug_layers_add == "yes":
+            bufg['OUTPUT'].setName("DEBUG_intersect_grid")
+            QgsProject.instance().addMapLayer(bufg['OUTPUT'])
+        #
         pd.options.mode.chained_assignment = None
         # Change to pandas dataframe to order polygon features
         cols = [f.name() for f in bufg['OUTPUT'].fields()]
@@ -268,16 +381,15 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         df["Xcoln"] = 0
 
         for nuu in range(1, len(df)):
-            nuu2 = int(df.loc[df['order'] == nuu]['row_num'])
-            nuu3 = int(df.loc[df['order'] == nuu - 1]['row_num'])
-            if nuu == 0:
-                nuu = 0
-            elif df.top[nuu2] == df.top[nuu3]:
-                df.Ycoln[nuu2] = df.Ycoln[nuu3]
-                df.Xcoln[nuu2] = df.Xcoln[nuu3] + 1
+            nuu2 = int(df.loc[df['order'] == nuu, 'row_num'].iloc[0])
+            nuu3 = int(df.loc[df['order'] == nuu - 1, 'row_num'].iloc[0])
+
+            if df.top[nuu2] == df.top[nuu3]:
+                df.loc[nuu2, 'Ycoln'] = df.loc[nuu3, 'Ycoln']
+                df.loc[nuu2, 'Xcoln'] = df.loc[nuu3, 'Xcoln'] + 1
             else:
-                df.Ycoln[nuu2] = df.Ycoln[nuu3] + 1
-                df.Xcoln[nuu2] = 0
+                df.loc[nuu2, 'Ycoln'] = df.loc[nuu3, 'Ycoln'] + 1
+                df.loc[nuu2, 'Xcoln'] = 0
 
         # Number of y and x columns
         numycol = df['Ycoln'].max() + 1
@@ -368,7 +480,9 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                         # Merge two back together
                         bufg = processing.run("native:mergevectorlayers", {'LAYERS': shplist, 'OUTPUT': 'memory:'})
 
-        #QgsProject.instance().addMapLayer(bufg['OUTPUT'])
+        if debug_layers_add == "yes":
+            bufg['OUTPUT'].setName("DEBUG_merged_intersect_grid")
+            QgsProject.instance().addMapLayer(bufg['OUTPUT'])
 
         # Reorder cells
         # Change to pandas dataframe
@@ -426,7 +540,7 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
 
         # A good buffer to use is roughly 1/80th of the smallest size of the map
         # (this therefore scales for latitude differences and map sheet size differences etc.)
-        bufssmal = ssmax / 80
+        bufssmal = ssmax / 75
 
         # Buffer grid to have a slightly overlap
         bufgs = processing.run("native:buffer", {'INPUT': bufg['OUTPUT'], 'DISTANCE': str(bufssmal),
@@ -450,23 +564,158 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         cent = processing.run("native:saveselectedfeatures", {'INPUT': bufgs['OUTPUT'],
                                                               'OUTPUT': 'memory:'
                                                               })
-
-        #QgsProject.instance().addMapLayer(cent['OUTPUT'])
+        if debug_layers_add == "yes":
+            cent['OUTPUT'].setName("DEBUG_grid_centre")
+            QgsProject.instance().addMapLayer(cent['OUTPUT'])
 
         # What to use as percentile and length for finding lines
         quanyy = self.parameterAsInt(parameters, self.LINEQUAL, context)
-        if quanyy == 2:
-            quantty = 20
-            lengthrr = 40
-            quna = 'Low'
-        elif quanyy == 0:
+
+        #If auto, find the largest IQR of bands, if larger range set to High level of detail, if lower then set to low
+        if quanyy == 5:
+            ext = vll  # your original extent
+
+            xminsm = xminfl
+            xmaxsm = xmaxfl
+            yminsm = yminfl
+            ymaxsm = ymaxfl
+
+            widthsm = xmaxsm - xminsm
+            heightsm = ymaxsm - yminsm
+
+            # 60% of width/height
+            new_width = widthsm * 0.75
+            new_height = heightsm * 0.75
+
+            # Centre of original extent
+            cxsm = xminsm + widthsm / 2
+            cysm = yminsm + heightsm / 2
+
+            # New (central) extent
+            new_xmin = cxsm - new_width / 2
+            new_xmax = cxsm + new_width / 2
+            new_ymin = cysm - new_height / 2
+            new_ymax = cysm + new_height / 2
+
+            central_extent = QgsRectangle(new_xmin, new_ymin, new_xmax, new_ymax)
+            # Random points in extent
+            quanpoints = processing.run(
+                'native:randompointsinextent',
+                {
+                    'EXTENT': central_extent,
+                    'MAX_ATTEMPTS': 200,
+                    'MIN_DISTANCE': 0,
+                    'OUTPUT': 'TEMPORARY_OUTPUT',
+                    'POINTS_NUMBER': 10000,
+                    'TARGET_CRS': vll.crs(),
+                }
+            )['OUTPUT']
+
+            # Sample raster values at those points
+            quanpointssam = processing.run(
+                'native:rastersampling',
+                {
+                    'INPUT': quanpoints,
+                    'RASTERCOPY': rlayer,
+                    'COLUMN_PREFIX': 'BAND_',
+                    'OUTPUT': 'TEMPORARY_OUTPUT',
+                }
+            )['OUTPUT']
+
+            # Extract BAND_1, BAND_2, BAND_3 values safely and average per point
+            values = []
+            for f in quanpointssam.getFeatures():
+                b1 = f['BAND_1']
+                b2 = f['BAND_2']
+                b3 = f['BAND_3']
+                if b1 is not None and b2 is not None and b3 is not None:  # keep 0 values!
+                    values.append((b1 + b2 + b3) / 3)
+
+            # Convert to numpy array
+            arr = np.array(values, dtype=float)
+
+            # Remove NaN just in case
+            arr = arr[~np.isnan(arr)]
+
+            # Compute quartiles + IQR
+            q1 = np.percentile(arr, 25)
+            q3 = np.percentile(arr, 75)
+            iqr = q3 - q1
+            print('IQR', iqr)
+            std = np.std(arr)
+            print('STD', std)
+
+            message3 = self.tr("IQR range is: {:.2f}").format(iqr)
+            feedback.pushInfo(message3)
+            message2 = self.tr("Standard deviation level is: {:.2f}").format(std)
+            feedback.pushInfo(message2)
+
+            # Dynamic continuous scaling based on standard deviation
+            std_clamped = max(5, min(std, 80))
+
+            if std_clamped <= 15:
+                t = (std_clamped - 5) / (15 - 5)
+                quantty = 10 + t * (13 - 10)
+                lengthrr = 24 + t * (28 - 24)
+            elif std_clamped <= 25:
+                t = (std_clamped - 15) / (25 - 15)
+                quantty = 13 + t * (16 - 13)
+                lengthrr = 28 + t * (32 - 28)
+            elif std_clamped <= 37:
+                t = (std_clamped - 25) / (37 - 25)
+                quantty = 16 + t * (21 - 16)
+                lengthrr = 32 + t * (40 - 32)
+            elif std_clamped <= 55:
+                t = (std_clamped - 37) / (55 - 37)
+                quantty = 21 + t * (27 - 21)
+                lengthrr = 40 + t * (50 - 40)
+            elif std_clamped <= 70:
+                t = (std_clamped - 55) / (70 - 55)
+                quantty = 27 + t * (34 - 27)
+                lengthrr = 50 + t * (60 - 50)
+            else:
+                t = (std_clamped - 70) / (80 - 70)
+                quantty = 34 + t * (45 - 34)
+                lengthrr = 60 + t * (65 - 60)
+
+            auto_quantty = round(quantty)
+            auto_lengthrr = round(lengthrr)
+            quantty = auto_quantty
+            lengthrr = auto_lengthrr
+            quna = 'Auto'
+            # Optional: Print or log the calculated values to verify
+            print(f"Calculated - Quant: {quantty}, Length: {lengthrr}")
+            message4 = self.tr("Calculated - Quant: {:.2f}").format(quantty)
+            feedback.pushInfo(message4)
+            message5 = self.tr("Calculated - Length: {:.2f}").format(lengthrr)
+            feedback.pushInfo(message5)
+
+        if quanyy == 0:
             quantty = 7
             lengthrr = 22
-            quna = 'High'
-        else:
+            quna = 'Very High'
+        elif quanyy == 1:
             quantty = 13
             lengthrr = 28
+            quna = 'High'
+        elif quanyy == 2:
+            quantty = 20
+            lengthrr = 40
             quna = 'Medium'
+        elif quanyy == 3:
+            quantty = 30
+            lengthrr = 60
+            quna = 'Low'
+        elif quanyy == 4:
+            quantty = 50
+            lengthrr = 80
+            quna = 'Very Low'
+
+
+        # Print which feature level is being used
+        message = self.tr("Quality of map area border line level used is: {}").format(quna)
+        feedback.pushInfo(message)
+
 
         # Loop for all sides of map sheet
         lpvar = [1, 3, 5, 7]  # Sides of map sheet
@@ -476,92 +725,82 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         angpoin = [90, 0, 0, 90]  # Rough angle that points are facing
         ritnum = 0 #
         feedback.setProgress(int(30))
-        # Loop for all sides of the map to find the border lines
-        for it in range(len(lpvar)):
-            #
-            ssid = '"order2"=\'' + str(lpvar[it]) + '\''
-            #
-            # Expression to select the side
-            bufgs['OUTPUT'].selectByExpression(ssid, QgsVectorLayer.SetSelection)
-            #
-            side = processing.run("native:saveselectedfeatures", {'INPUT': bufgs['OUTPUT'],
-                                                                  'OUTPUT': 'memory:'
-                                                                  })
-            #
-            # QgsProject.instance().addMapLayer(side['OUTPUT'])
-            #
-            # intersect of centre and side polygons
-            intersere = processing.run("native:intersection", {'INPUT': cent['OUTPUT'],
-                                                             'OVERLAY': side['OUTPUT'],
-                                                             'OUTPUT': 'memory:'
-                                                             })['OUTPUT']
-            #
-            # QgsProject.instance().addMapLayer(intersere['OUTPUT'])
-            # If the left side was moved due to not being in the correct place, then move the right too
-            if ritnum != 0 and lpordco[it] == 'y':
-                # how far has it moved? (+1 to make sure)
-                moo = (intersere.extent().xMaximum() - intersere.extent().xMinimum()) * (ritnum + 1)
-                # Change x coords
-                newxmax = intersere.extent().xMaximum() - moo
-                newxmin = intersere.extent().xMinimum() - moo
-                newymin = intersere.extent().yMinimum()
-                newymax = intersere.extent().yMaximum()
-                # Create new polygon
-                vll5 = QgsVectorLayer("Polygon", "temp", "memory")
+
+        # Auto move down in quality if it fails in the chosen quality level by auto
+        was_auto = (self.parameterAsInt(parameters, self.LINEQUAL, context) == 4)
+        quality_order = [0, 1, 2, 3, 4, 5]  # Very High, High, Medium, Low, Very Low, auto
+        current_quality_idx = quality_order.index(quanyy)
+        success = False
+
+        while not success:
+            # re-set quantty/lengthrr/quna based on current quanyy
+            if quanyy == 0:
+                quantty = 7
+                lengthrr = 22
+                quna = 'Very High'
+            elif quanyy == 2:
+                quantty = 20
+                lengthrr = 40
+                quna = 'Medium'
+            elif quanyy == 3:
+                quantty = 30
+                lengthrr = 60
+                quna = 'Low'
+            elif quanyy == 4:
+                quantty = 50
+                lengthrr = 80
+                quna = 'Very Low'
+            elif quanyy == 5:
+                quantty = auto_quantty;
+                lengthrr = auto_lengthrr;
+                quna = 'Auto'
+            else:
+                quantty = 13
+                lengthrr = 28
+                quna = 'High'
+
+            line_failed = False
+
+            # Loop for all sides of the map to find the border lines
+            for it in range(len(lpvar)):
                 #
-                # Add some attribute data
-                prrectt = vll5.dataProvider()
-                prrectt.addAttributes([QgsField("ID", QVariant.Int)])
-                vll5.updateFields()
+                ssid = '"order2"=\'' + str(lpvar[it]) + '\''
                 #
-                # Add the polygon to the layer
-                frectt = QgsFeature()
+                # Expression to select the side
+                bufgs['OUTPUT'].selectByExpression(ssid, QgsVectorLayer.SetSelection)
                 #
-                # Set extent
-                frectt.setGeometry(
-                    QgsGeometry.fromPolygonXY([[QgsPointXY(newxmin, newymin), QgsPointXY(newxmin, newymax),
-                                                QgsPointXY(newxmax, newymax),
-                                                QgsPointXY(newxmax, newymin)]]))
+                side = processing.run("native:saveselectedfeatures", {'INPUT': bufgs['OUTPUT'],
+                                                                      'OUTPUT': 'memory:'
+                                                                      })
                 #
-                # Create and load polygon
-                frectt.setAttributes([1])
-                prrectt.addFeature(frectt)
-                vll5.updateExtents()
+                # QgsProject.instance().addMapLayer(side['OUTPUT'])
                 #
-                #QgsProject.instance().addMapLayer(vll5)
-                intersere = vll5
-            ritnum = 0
-            # While loop (incase it is focused on wrong part of raster)
-            finfeat = 0
-            repnum = 0
-            while finfeat == 0:
-                # If it is not the first loop calculate new area to look in
-                if repnum == 1:
-                    ritnum = ritnum + 1
-                    # Work out new area for search
-                    if lpvar[it] == 3:
-                        # Work out new min and max
-                        newxmax = intersere.extent().xMinimum()
-                        newxmin = intersere.extent().xMinimum() - (
-                                    intersere.extent().xMaximum() - intersere.extent().xMinimum())
-                        newymin = intersere.extent().yMinimum()
-                        newymax = intersere.extent().yMaximum()
-                    elif lpvar[it] == 5:
-                        # Work out new min and max
-                        newxmax = intersere.extent().xMaximum() + (
-                                    intersere.extent().xMaximum() - intersere.extent().xMinimum())
-                        newxmin = intersere.extent().xMaximum()
-                        newymin = intersere.extent().yMinimum()
-                        newymax = intersere.extent().yMaximum()
-                    #
-                    print(ritnum)
+                # intersect of centre and side polygons
+                intersere = processing.run("native:intersection", {'INPUT': cent['OUTPUT'],
+                                                                 'OVERLAY': side['OUTPUT'],
+                                                                 'OUTPUT': 'memory:'
+                                                                 })['OUTPUT']
+                #
+                #feedback.pushInfo(f'Side {it} initial intersere extent: {intersere.extent().toString()}')
+                if debug_layers_add == "yes":
+                    intersere.setName("DEBUG_possible_line_location")
+                    QgsProject.instance().addMapLayer(intersere)
+                # If the left side was moved due to not being in the correct place, then move the right too
+                if ritnum != 0 and lpordco[it] == 'y':
+                    # how far has it moved? (+1 to make sure)
+                    moo = (intersere.extent().xMaximum() - intersere.extent().xMinimum()) * (ritnum + 1)
+                    # Change x coords
+                    newxmax = intersere.extent().xMaximum() - moo
+                    newxmin = intersere.extent().xMinimum() - moo
+                    newymin = intersere.extent().yMinimum()
+                    newymax = intersere.extent().yMaximum()
                     # Create new polygon
-                    vll4 = QgsVectorLayer("Polygon", "temp", "memory")
+                    vll5 = QgsVectorLayer("Polygon", "temp", "memory")
                     #
                     # Add some attribute data
-                    prrectt = vll4.dataProvider()
+                    prrectt = vll5.dataProvider()
                     prrectt.addAttributes([QgsField("ID", QVariant.Int)])
-                    vll4.updateFields()
+                    vll5.updateFields()
                     #
                     # Add the polygon to the layer
                     frectt = QgsFeature()
@@ -575,343 +814,448 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                     # Create and load polygon
                     frectt.setAttributes([1])
                     prrectt.addFeature(frectt)
-                    vll4.updateExtents()
+                    vll5.updateExtents()
                     #
-                    #QgsProject.instance().addMapLayer(vll4)
-                    intersere = vll4
-                repnum = 1
-                # Clip raster by intersection
-                #
-                result = processing.run('gdal:cliprasterbyextent', {'INPUT': rlayer,
-                                                                    'PROJWIN': intersere,
-                                                                    'DATA_TYPE': 0,
-                                                                    'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
-                                                                    })['OUTPUT']
-                result = QgsRasterLayer(result)
-                # Find 5000 random points in extent
-                quanpoints = processing.run('native:randompointsinextent', {'EXTENT': intersere,
-                                                                            'MAX_ATTEMPTS': 200,
-                                                                            'MIN_DISTANCE': 0,
-                                                                            'OUTPUT': 'TEMPORARY_OUTPUT',
-                                                                            'POINTS_NUMBER': 5000,
-                                                                            'TARGET_CRS': vll.crs(),
-                                                                            })['OUTPUT']
-                # Find pixel values of these points to be used to calculate percentile value
-                quanpointssam = processing.run('native:rastersampling', {'INPUT': quanpoints,
-                                                                         'RASTERCOPY': result,
-                                                                         'COLUMN_PREFIX': 'BAND_',
-                                                                         'OUTPUT': 'TEMPORARY_OUTPUT',
-                                                                         })['OUTPUT']
-                # Make individual inputs of each raster band
-                # band1
-                rasba1 = processing.run('gdal:translate', {'COPY_SUBDATASETS': False,
-                                                           'DATA_TYPE': 0,
-                                                           'EXTRA': '-b 1',
-                                                           'INPUT': result,
-                                                           'NODATA': None,
-                                                           'OPTIONS': '',
-                                                           'OUTPUT': 'TEMPORARY_OUTPUT',
-                                                           'TARGET_CRS': None})['OUTPUT']
-                rasb1result = QgsRasterLayer(rasba1)
-                entries = []
-                #
-                rasb1 = QgsRasterCalculatorEntry()
-                rasb1.ref = 'rasout@1'
-                rasb1.raster = rasb1result
-                rasb1.bandNumber = 1
-                entries.append(rasb1)
-                # iface.addRasterLayer(rasba1)
-                # band2
-                rasba2 = processing.run('gdal:translate', {'COPY_SUBDATASETS': False,
-                                                           'DATA_TYPE': 0,
-                                                           'EXTRA': '-b 2',
-                                                           'INPUT': result,
-                                                           'NODATA': None,
-                                                           'OPTIONS': '',
-                                                           'OUTPUT': 'TEMPORARY_OUTPUT',
-                                                           'TARGET_CRS': None})['OUTPUT']
-                rasb2result = QgsRasterLayer(rasba2)
-                rasb2 = QgsRasterCalculatorEntry()
-                rasb2.ref = 'rasout@2'
-                rasb2.raster = rasb2result
-                rasb2.bandNumber = 1
-                entries.append(rasb2)
-                # iface.addRasterLayer(rasba2)
-                # band3
-                rasba3 = processing.run('gdal:translate', {'COPY_SUBDATASETS': False,
-                                                           'DATA_TYPE': 0,
-                                                           'EXTRA': '-b 3',
-                                                           'INPUT': result,
-                                                           'NODATA': None,
-                                                           'OPTIONS': '',
-                                                           'OUTPUT': 'TEMPORARY_OUTPUT',
-                                                           'TARGET_CRS': None})['OUTPUT']
-                rasb3result = QgsRasterLayer(rasba3)
-                rasb3 = QgsRasterCalculatorEntry()
-                rasb3.ref = 'rasout@3'
-                rasb3.raster = rasb3result
-                rasb3.bandNumber = 1
-                entries.append(rasb3)
-                # iface.addRasterLayer(rasba3)
-                # Add raster bands together
-                rasbanall = QgsProcessingUtils.generateTempFilename('rasbanall.tif')
-                #
-                calc = QgsRasterCalculator('rasout@1 + rasout@2 + rasout@3', rasbanall, 'GTiff', result.extent(),
-                                           result.width(),
-                                           result.height(), entries)
-                calc.processCalculation()
-                #iface.addRasterLayer(rasbanall)
-                rasoutall = QgsRasterLayer(rasbanall)
-                #
-                # Find percentile of the middle section of raster filtering out blank values
-                stats = rasoutall.dataProvider().bandStatistics(1, QgsRasterBandStats.All)
-                dataquanpoints1 = list(
-                    filter(None, [f['BAND_1'] for f in quanpointssam.getFeatures()]))  # List all values in column
-                dataquanpoints2 = list(
-                    filter(None, [f['BAND_2'] for f in quanpointssam.getFeatures()]))  # List all values in column
-                dataquanpoints3 = list(
-                    filter(None, [f['BAND_3'] for f in quanpointssam.getFeatures()]))  # List all values in column
-                # loop for percentile value determined by line quality
-                for p in [quantty]:
-                    rasbanallquan = round((np.percentile(dataquanpoints1, p)) + (np.percentile(dataquanpoints2, p)) \
-                                          + (np.percentile(dataquanpoints3, p)))
-                    print(rasbanallquan)
-                #
-                # Reclassify full raster using the percentile value into 0 (not possible line) and 1 (possible line)
-                rasoutreclass = processing.run('native:reclassifybytable', {'DATA_TYPE': 0,
-                                                                            'INPUT_RASTER': rasoutall,
-                                                                            'NODATA_FOR_MISSING': False,
-                                                                            'NO_DATA': -9999,
-                                                                            'OUTPUT': 'TEMPORARY_OUTPUT',
-                                                                            'RANGE_BOUNDARIES': 0,
-                                                                            'RASTER_BAND': 1,
-                                                                            'TABLE': [stats.minimumValue, rasbanallquan,
-                                                                                      '0',
-                                                                                      rasbanallquan, stats.maximumValue,
-                                                                                      '1'],
-                                                                            })['OUTPUT']
-                #
-                #iface.addRasterLayer(rasoutreclass)
-                # Sieve reclassified raster to remove any isolate small areas of pixels
-                rastest2 = processing.run('gdal:sieve', {'INPUT': rasoutreclass,
-                                                         'THRESHOLD:': 40,
-                                                         'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT})['OUTPUT']
-                #iface.addRasterLayer(rastest2)
-                # Make a shapefile and vectorise raster as contours
-                tpol = QgsProcessingUtils.generateTempFilename('tpollo.shp')
-                polre = processing.run('gdal:contour', {'INPUT': rastest2, 'BAND': 1, 'INTERVAL': 1, 'OUTPUT': tpol})[
-                    'OUTPUT']
-                polrev = QgsVectorLayer(polre, 'vec', 'ogr')
-                # QgsProject.instance().addMapLayer(polrev)
-                #
-                # Reproject to 3857 so that simplification can be calulated in metres
-                plinesrep = processing.run("native:reprojectlayer", {'INPUT': polrev,
-                                                                     'TARGET_CRS': 'EPSG:3857',
-                                                                     'OUTPUT': 'memory:'})
-                #
-                # QgsProject.instance().addMapLayer(plinesrep['OUTPUT'])
-                #
-                # Simplify contour lines to 20 metres
-                plinessimp = processing.run("native:simplifygeometries", {'INPUT': plinesrep['OUTPUT'],
-                                                                          'METHOD': '0',
-                                                                          'TOLERANCE': '20',
+                    #QgsProject.instance().addMapLayer(vll5)
+                    intersere = vll5
+                ritnum = 0
+                # While loop (incase it is focused on wrong part of raster)
+                finfeat = 0
+                repnum = 0
+                max_retries = 20 # This is the max number of times a side will loop for.
+                retry_overlap = 0.10  # 10% overlap between successive search polygons
+
+                while finfeat == 0 and repnum < max_retries:
+                    # If it is not the first loop calculate new area to look in
+                    if repnum > 0:
+                        ritnum = ritnum + 1
+
+                        # Work out new area for search
+                        if lpvar[it] == 3:
+                            # Move west, with 10% overlap
+                            search_width = (
+                                    intersere.extent().xMaximum()
+                                    - intersere.extent().xMinimum()
+                            )
+                            overlap = search_width * retry_overlap
+
+                            newxmax = intersere.extent().xMinimum() + overlap
+                            newxmin = intersere.extent().xMinimum() - search_width + overlap
+                            newymin = intersere.extent().yMinimum()
+                            newymax = intersere.extent().yMaximum()
+
+                        elif lpvar[it] == 5:
+                            # Move east, with 10% overlap
+                            search_width = (
+                                    intersere.extent().xMaximum()
+                                    - intersere.extent().xMinimum()
+                            )
+                            overlap = search_width * retry_overlap
+
+                            newxmax = intersere.extent().xMaximum() + search_width - overlap
+                            newxmin = intersere.extent().xMaximum() - overlap
+                            newymin = intersere.extent().yMinimum()
+                            newymax = intersere.extent().yMaximum()
+
+                        elif lpvar[it] == 1:  # bottom
+                            # Move south, with 10% overlap
+                            search_height = (
+                                    intersere.extent().yMaximum()
+                                    - intersere.extent().yMinimum()
+                            )
+                            overlap = search_height * retry_overlap
+
+                            newxmin = intersere.extent().xMinimum()
+                            newxmax = intersere.extent().xMaximum()
+                            newymax = intersere.extent().yMinimum() + overlap
+                            newymin = intersere.extent().yMinimum() - search_height + overlap
+
+                        elif lpvar[it] == 7:  # top
+                            # Move north, with 10% overlap
+                            search_height = (
+                                    intersere.extent().yMaximum()
+                                    - intersere.extent().yMinimum()
+                            )
+                            overlap = search_height * retry_overlap
+
+                            newxmin = intersere.extent().xMinimum()
+                            newxmax = intersere.extent().xMaximum()
+                            newymin = intersere.extent().yMaximum() - overlap
+                            newymax = intersere.extent().yMaximum() + search_height - overlap
+                        #
+                        print(ritnum)
+                        # Create new polygon
+                        vll4 = QgsVectorLayer("Polygon", "temp", "memory")
+                        #
+                        # Add some attribute data
+                        prrectt = vll4.dataProvider()
+                        prrectt.addAttributes([QgsField("ID", QVariant.Int)])
+                        vll4.updateFields()
+                        #
+                        # Add the polygon to the layer
+                        frectt = QgsFeature()
+                        #
+                        # Set extent
+                        frectt.setGeometry(
+                            QgsGeometry.fromPolygonXY([[QgsPointXY(newxmin, newymin), QgsPointXY(newxmin, newymax),
+                                                        QgsPointXY(newxmax, newymax),
+                                                        QgsPointXY(newxmax, newymin)]]))
+                        #
+                        # Create and load polygon
+                        frectt.setAttributes([1])
+                        prrectt.addFeature(frectt)
+                        vll4.updateExtents()
+                        #
+                        #QgsProject.instance().addMapLayer(vll4)
+                        intersere = vll4
+                    repnum += 1
+                    # Clip raster by intersection
+                    #
+                    result = processing.run('gdal:cliprasterbyextent', {'INPUT': rlayer,
+                                                                        'PROJWIN': intersere,
+                                                                        'DATA_TYPE': 0,
+                                                                        'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT,
+                                                                        })['OUTPUT']
+                    if debug_layers_add == "yes":
+                        iface.addRasterLayer(result)
+                    #
+                    result = QgsRasterLayer(result)
+                    #
+                    # Find 5000 random points in extent
+                    quanpoints = processing.run('native:randompointsinextent', {'EXTENT': intersere,
+                                                                                'MAX_ATTEMPTS': 200,
+                                                                                'MIN_DISTANCE': 0,
+                                                                                'OUTPUT': 'TEMPORARY_OUTPUT',
+                                                                                'POINTS_NUMBER': 2000,
+                                                                                'TARGET_CRS': vll.crs(),
+                                                                                })['OUTPUT']
+                    # Find pixel values of these points to be used to calculate percentile value
+                    quanpointssam = processing.run('native:rastersampling', {'INPUT': quanpoints,
+                                                                             'RASTERCOPY': result,
+                                                                             'COLUMN_PREFIX': 'BAND_',
+                                                                             'OUTPUT': 'TEMPORARY_OUTPUT',
+                                                                             })['OUTPUT']
+                    # Make individual inputs of each raster band
+                    # band1
+                    rasba1 = processing.run('gdal:translate', {'COPY_SUBDATASETS': False,
+                                                               'DATA_TYPE': 0,
+                                                               'EXTRA': '-b 1',
+                                                               'INPUT': result,
+                                                               'NODATA': None,
+                                                               'OPTIONS': '',
+                                                               'OUTPUT': 'TEMPORARY_OUTPUT',
+                                                               'TARGET_CRS': None})['OUTPUT']
+                    rasb1result = QgsRasterLayer(rasba1)
+                    entries = []
+                    #
+                    rasb1 = QgsRasterCalculatorEntry()
+                    rasb1.ref = 'rasout@1'
+                    rasb1.raster = rasb1result
+                    rasb1.bandNumber = 1
+                    entries.append(rasb1)
+                    #iface.addRasterLayer(rasba1)
+                    # band2
+                    rasba2 = processing.run('gdal:translate', {'COPY_SUBDATASETS': False,
+                                                               'DATA_TYPE': 0,
+                                                               'EXTRA': '-b 2',
+                                                               'INPUT': result,
+                                                               'NODATA': None,
+                                                               'OPTIONS': '',
+                                                               'OUTPUT': 'TEMPORARY_OUTPUT',
+                                                               'TARGET_CRS': None})['OUTPUT']
+                    rasb2result = QgsRasterLayer(rasba2)
+                    rasb2 = QgsRasterCalculatorEntry()
+                    rasb2.ref = 'rasout@2'
+                    rasb2.raster = rasb2result
+                    rasb2.bandNumber = 1
+                    entries.append(rasb2)
+                    #iface.addRasterLayer(rasba2)
+                    # band3
+                    rasba3 = processing.run('gdal:translate', {'COPY_SUBDATASETS': False,
+                                                               'DATA_TYPE': 0,
+                                                               'EXTRA': '-b 3',
+                                                               'INPUT': result,
+                                                               'NODATA': None,
+                                                               'OPTIONS': '',
+                                                               'OUTPUT': 'TEMPORARY_OUTPUT',
+                                                               'TARGET_CRS': None})['OUTPUT']
+                    rasb3result = QgsRasterLayer(rasba3)
+                    rasb3 = QgsRasterCalculatorEntry()
+                    rasb3.ref = 'rasout@3'
+                    rasb3.raster = rasb3result
+                    rasb3.bandNumber = 1
+                    entries.append(rasb3)
+                    # iface.addRasterLayer(rasba3)
+                    # Add raster bands together
+                    rasbanall = QgsProcessingUtils.generateTempFilename('rasbanall.tif')
+                    #
+                    calc = QgsRasterCalculator('rasout@1 + rasout@2 + rasout@3', rasbanall, 'GTiff', result.extent(),
+                                               result.width(),
+                                               result.height(), entries)
+                    calc.processCalculation()
+                    if debug_layers_add == "yes":
+                        iface.addRasterLayer(rasbanall)
+                    #
+                    rasoutall = QgsRasterLayer(rasbanall)
+                    #
+                    # Find percentile of the middle section of raster filtering out blank values
+                    stats = rasoutall.dataProvider().bandStatistics(1, QgsRasterBandStats.All)
+                    dataquanpoints1 = list(
+                        filter(None, [f['BAND_1'] for f in quanpointssam.getFeatures()]))  # List all values in column
+                    dataquanpoints2 = list(
+                        filter(None, [f['BAND_2'] for f in quanpointssam.getFeatures()]))  # List all values in column
+                    dataquanpoints3 = list(
+                        filter(None, [f['BAND_3'] for f in quanpointssam.getFeatures()]))  # List all values in column
+                    # loop for percentile value determined by line quality
+                    for p in [quantty]:
+                        rasbanallquan = round((np.percentile(dataquanpoints1, p)) + (np.percentile(dataquanpoints2, p)) \
+                                              + (np.percentile(dataquanpoints3, p)))
+                        print(rasbanallquan)
+                    #
+                    # Reclassify full raster using the percentile value into 0 (not possible line) and 1 (possible line)
+                    rasoutreclass = processing.run('native:reclassifybytable', {'DATA_TYPE': 0,
+                                                                                'INPUT_RASTER': rasoutall,
+                                                                                'NODATA_FOR_MISSING': False,
+                                                                                'NO_DATA': -9999,
+                                                                                'OUTPUT': 'TEMPORARY_OUTPUT',
+                                                                                'RANGE_BOUNDARIES': 0,
+                                                                                'RASTER_BAND': 1,
+                                                                                'TABLE': [stats.minimumValue, rasbanallquan,
+                                                                                          '0',
+                                                                                          rasbanallquan, stats.maximumValue,
+                                                                                          '1'],
+                                                                                })['OUTPUT']
+                    #
+                    #iface.addRasterLayer(rasoutreclass)
+
+                    # Sieve reclassified raster to remove any isolate small areas of pixels
+                    rastest2 = processing.run('gdal:sieve', {'INPUT': rasoutreclass,
+                                                             'THRESHOLD:': 40,
+                                                             'OUTPUT': QgsProcessing.TEMPORARY_OUTPUT})['OUTPUT']
+                    #
+                    if debug_layers_add == "yes":
+                        debug_sieved = QgsRasterLayer(rastest2, "DEBUG_sieved")
+                        QgsProject.instance().addMapLayer(debug_sieved)
+                    #
+                    # Make a shapefile and vectorise raster as contours
+                    tpol = QgsProcessingUtils.generateTempFilename('tpollo.shp')
+                    polre = processing.run('gdal:contour', {'INPUT': rastest2, 'BAND': 1, 'INTERVAL': 0.5, 'OUTPUT': tpol})[
+                        'OUTPUT']
+                    polrev = QgsVectorLayer(polre, 'vec', 'ogr')
+                    #
+                    if debug_layers_add == "yes":
+                        polrev.setName("DEBUG_contour")
+                        QgsProject.instance().addMapLayer(polrev)
+                    #
+                    #
+                    # Reproject to 3857 so that simplification can be calulated in metres
+                    plinesrep = processing.run("native:reprojectlayer", {'INPUT': polrev,
+                                                                         'TARGET_CRS': 'EPSG:3857',
+                                                                         'OUTPUT': 'memory:'})
+                    #
+                    # QgsProject.instance().addMapLayer(plinesrep['OUTPUT'])
+                    #
+                    # Simplify contour lines to 20 metres
+                    plinessimp = processing.run("native:simplifygeometries", {'INPUT': plinesrep['OUTPUT'],
+                                                                              'METHOD': '0',
+                                                                              'TOLERANCE': '20',
+                                                                              'OUTPUT': 'memory:'})
+                    #
+                    #plinesrep['OUTPUT'].setName("DEBUG_before_simplify")
+                    #QgsProject.instance().addMapLayer(plinesrep['OUTPUT'])
+                    #
+                    if debug_layers_add == "yes":
+                        plinessimp['OUTPUT'].setName("DEBUG_after_simplify")
+                        QgsProject.instance().addMapLayer(plinessimp['OUTPUT'])
+                    #
+                    # Explode the lines
+                    plinesexpO = processing.run("native:explodelines", {'INPUT': plinessimp['OUTPUT'],
+                                                                        'OUTPUT': 'memory:'})
+                    #
+                    # Calculate length of the exploded features
+                    newlength = processing.run("qgis:exportaddgeometrycolumns", {'INPUT': plinesexpO['OUTPUT'],
+                                                                                 'CALC_METHOD': 2,
+                                                                                 'OUTPUT': 'memory:'
+                                                                                 })
+                    #
+                    # Find the minimum length a line should be to qualify as possible border line using the length of the
+                    # longest intersect line
+                    interserepl = processing.run("native:polygonstolines", {'INPUT': intersere,
+                                                                            'OUTPUT': 'memory:'
+                                                                            })
+                    intersereple = processing.run("native:explodelines", {'INPUT': interserepl['OUTPUT'],
                                                                           'OUTPUT': 'memory:'})
-                #
-                # QgsProject.instance().addMapLayer(plinessimp['OUTPUT'])
-                # Explode the lines
-                plinesexpO = processing.run("native:explodelines", {'INPUT': plinessimp['OUTPUT'],
-                                                                    'OUTPUT': 'memory:'})
-                #
-                # QgsProject.instance().addMapLayer(plinesexpO['OUTPUT'])
-                # Calculate length of the exploded features
-                newlength = processing.run("qgis:exportaddgeometrycolumns", {'INPUT': plinesexpO['OUTPUT'],
-                                                                             'CALC_METHOD': 2,
-                                                                             'OUTPUT': 'memory:'
-                                                                             })
-                # Find the minimum length a line should be to qualify as possible border line using the length of the
-                # longest intersect line
-                interserepl = processing.run("native:polygonstolines", {'INPUT': intersere,
-                                                                        'OUTPUT': 'memory:'
-                                                                        })
-                intersereple = processing.run("native:explodelines", {'INPUT': interserepl['OUTPUT'],
-                                                                      'OUTPUT': 'memory:'})
-                # Calculate length of intersect lines and find longest
-                intersereplelength = processing.run("qgis:exportaddgeometrycolumns", {'INPUT': intersereple['OUTPUT'],
-                                                                                      'CALC_METHOD': 2,
-                                                                                      'OUTPUT': 'memory:'
-                                                                                      })
-                insidx = intersereplelength['OUTPUT'].fields().indexFromName('length')
-                # Find starting minimum length value
-                inssmax = (intersereplelength['OUTPUT'].maximumValue(insidx)) / lengthrr
-                #
-                # Find absolute minimum length value
-                absmin = inssmax / 1.5
-                # QgsProject.instance().addMapLayer(newlength['OUTPUT'])
-                # Select only features greater than the specified length
-                lendist = '"length" > ' + str(round(inssmax))
-                newlength['OUTPUT'].selectByExpression(lendist, QgsVectorLayer.SetSelection)
-                #
-                plinesexp_1000_selec = processing.run("native:saveselectedfeatures", {'INPUT': newlength['OUTPUT'],
-                                                                                      'OUTPUT': 'memory:'
-                                                                                      })
-                # There should be at least three lines, so if there is not, lower the maximum length required
-                # (up to the absolute minimum value) untill there are
-                numoffeat = plinesexp_1000_selec['OUTPUT'].featureCount()
-                qlen = 0
-                inssmaxsec = round((inssmax / 25))
-                qlenins = inssmax
-                while numoffeat < 3 and qlenins > absmin:
-                    print(qlenins)
-                    qlen = qlen + inssmaxsec
-                    qlenins = round(inssmax) - qlen
-                    lendist = '"length" > ' + str(qlenins)
+                    # Calculate length of intersect lines and find longest. Has to be done via raster calculator to
+                    # force a metres calculation for qgis 4.22+
+                    intersereplelength = processing.run("native:fieldcalculator", {
+                        'INPUT': intersereple['OUTPUT'],
+                        'FIELD_NAME': 'length',
+                        'FIELD_TYPE': 0,  # Float
+                        'FIELD_LENGTH': 20,
+                        'FIELD_PRECISION': 6,
+                        'FORMULA': "length(transform($geometry,'EPSG:4326','EPSG:3857'))",
+                        'OUTPUT': 'memory:'
+                    })
+                    #
+                    insidx = intersereplelength['OUTPUT'].fields().indexFromName('length')
+                    # Find starting minimum length value
+                    inssmax = (intersereplelength['OUTPUT'].maximumValue(insidx)) / lengthrr
+                    # Print length value message (a good check to see whether it is in metres or not)
+                    message27 =  self.tr("Minimum line section length: {}").format(round(inssmax))
+                    feedback.pushInfo(message27)
+                    #
+                    # Find absolute minimum length value
+                    absmin = inssmax / 1.5
+                    # QgsProject.instance().addMapLayer(newlength['OUTPUT'])
+                    # Select only features greater than the specified length and remove the rest
+                    lendist = '"length" > ' + str(round(inssmax))
                     newlength['OUTPUT'].selectByExpression(lendist, QgsVectorLayer.SetSelection)
                     #
-                    plinesexp_1000 = polrev.selectedFeatures()
+                    plinesexp_1000_selec = processing.run("native:extractbyexpression", {
+                        'INPUT': newlength['OUTPUT'],
+                        'EXPRESSION': lendist,
+                        'OUTPUT': 'memory:'
+                    })
                     #
-                    plinesexp_1000_selec = processing.run("native:saveselectedfeatures", {'INPUT': newlength['OUTPUT'],
-                                                                                          'OUTPUT': 'memory:'
-                                                                                          })
+                    if debug_layers_add == "yes":
+                        plinesexp_1000_selec['OUTPUT'].setName("DEBUG_selected_lines")
+                        QgsProject.instance().addMapLayer(plinesexp_1000_selec['OUTPUT'])
+                    #
+                    # There should be at least three lines, so if there is not, lower the maximum length required
+                    # (up to the absolute minimum value) until there are at least 3
                     numoffeat = plinesexp_1000_selec['OUTPUT'].featureCount()
-                    print('number of features = ', numoffeat)
-                #
-                # Lines should be at least 20% of the length of the intersect, or they are probably not real
-                plinesexp_1000_seleclength = processing.run("qgis:exportaddgeometrycolumns",
-                                                            {'INPUT': plinesexp_1000_selec['OUTPUT'],
-                                                             'CALC_METHOD': 2,
-                                                             'OUTPUT': 'memory:'
-                                                             })
-                # Sum length of lines
-                sumllpl = sum(filter(None, [f['length'] for f in plinesexp_1000_seleclength['OUTPUT'].getFeatures()]))
-                # If the sum length of lines is not more than 20% of the search area then it should not be considered
-                if sumllpl < intersereplelength['OUTPUT'].maximumValue(insidx) / 5:
-                    finfeat = 0
-                    continue
-                # QgsProject.instance().addMapLayer(plinesexp_1000_selec['OUTPUT'])
-                # Calculate bearing of features so to remove lines that arent going in roughly the right direction
-                layer_provider = plinesexp_1000_selec['OUTPUT'].dataProvider()
-                layer_provider.addAttributes([QgsField('angle', QVariant.Double)])
-                #
-                plinesexp_1000_selec['OUTPUT'].updateFields()
-                print(plinesexp_1000_selec['OUTPUT'].fields().names())
-                #
-                expression1 = QgsExpression('degrees(azimuth(start_point($geometry), end_point($geometry)))')
-                context2 = QgsExpressionContext()
-                context2.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(plinesexp_1000_selec['OUTPUT']))
-                #
-                with edit(plinesexp_1000_selec['OUTPUT']):
-                    for f in plinesexp_1000_selec['OUTPUT'].getFeatures():
-                        context2.setFeature(f)
-                        f['angle'] = expression1.evaluate(context2)
-                        plinesexp_1000_selec['OUTPUT'].updateFeature(f)
-                #
-                # QgsProject.instance().addMapLayer(plinesexp_1000_selec['OUTPUT'])
-                # Select only features that are heading in pretty much the correct direction
-                print(xyangll[it])
-                angttu = (xyangll[it] + 182)
-                angllu = (xyangll[it] + 178)
-                if angttu > 360:
-                    angttu = angttu - 360
-                    angllu = angllu - 360
+                    qlen = 0
+                    inssmaxsec = round((inssmax / 25))
+                    qlenins = inssmax
+                    while numoffeat < 3 and qlenins > absmin:
+                        print(qlenins)
+                        qlen = qlen + inssmaxsec
+                        qlenins = round(inssmax) - qlen
+                        lendist = '"length" > ' + str(qlenins)
+                        newlength['OUTPUT'].selectByExpression(lendist, QgsVectorLayer.SetSelection)
+                        #
+                        plinesexp_1000 = polrev.selectedFeatures()
+                        #
+                        plinesexp_1000_selec = processing.run("native:saveselectedfeatures", {'INPUT': newlength['OUTPUT'],
+                                                                                              'OUTPUT': 'memory:'
+                                                                                              })
+                        numoffeat = plinesexp_1000_selec['OUTPUT'].featureCount()
+                        print('number of features = ', numoffeat)
                     #
-                print(angllu)
-                angexp = ('"angle" > ' + str((xyangll[it] - 2)) + ' AND "angle" < ' + str((xyangll[it] + 2))
-                          + '  OR "angle" > ' + str((xyangll[it] + 178)) + ' AND "angle" < ' + str((xyangll[it] + 182))
-                          + ' OR "angle" > ' + str(angllu) + ' AND "angle" < ' + str(angttu))
-                #
-                plinesexp_1000_selec['OUTPUT'].selectByExpression(angexp, QgsVectorLayer.SetSelection)
-                #
-                plinesexp_ang_selec = processing.run("native:saveselectedfeatures",
-                                                     {'INPUT': plinesexp_1000_selec['OUTPUT'],
-                                                      'OUTPUT': 'memory:'
-                                                      })
-                #QgsProject.instance().addMapLayer(plinesexp_ang_selec['OUTPUT'])
-                # How many lines are there in this layer? If none then continue loop
-                finfeat = plinesexp_ang_selec['OUTPUT'].featureCount()
-                if finfeat == 0:
-                    continue
-                #
-                # Generate random points on each line
-                randpoint = processing.run("native:randompointsonlines", {'INPUT': plinesexp_ang_selec['OUTPUT'],
-                                                                          'POINTS_NUMBER': '5',
-                                                                          'OUTPUT': 'memory:'})
-                #
-                #QgsProject.instance().addMapLayer(randpoint['OUTPUT'])
-                #
-                # Add coordinates to line
-                layer_provider = randpoint['OUTPUT'].dataProvider()
-                layer_provider.addAttributes([QgsField('coord', QVariant.Double)])
-                #
-                randpoint['OUTPUT'].updateFields()
-                print(randpoint['OUTPUT'].fields().names())
-                #
-                xory = '$' + lpordco[it]
-                #
-                expression1 = QgsExpression(xory)
-                context2 = QgsExpressionContext()
-                context2.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(randpoint['OUTPUT']))
-                #
-                with edit(randpoint['OUTPUT']):
-                    for f in randpoint['OUTPUT'].getFeatures():
-                        context2.setFeature(f)
-                        f['coord'] = round(expression1.evaluate(context2), 2)
-                        randpoint['OUTPUT'].updateFeature(f)
-                #
-                # Join random points together with line using coordinates to make sure they are in correct order
-                # First check QGIS version (as it is slightly different between 3.16 and 3.22
-                if float(Qgis.QGIS_VERSION[0:4]) < 3.2:
-                    ordins = 'ORDER_FIELD'
-                    funordins = "qgis:pointstopath"
-                else:
-                    ordins = 'ORDER_EXPRESSION'
-                    funordins = "native:pointstopath"
-                #
-                linepoi = processing.run(funordins,
-                                         {'INPUT': randpoint['OUTPUT'], ordins: 'coord', 'OUTPUT': 'memory:'})
-                #
-                # QgsProject.instance().addMapLayer(linepoi['OUTPUT'])
-                #
-                # Simplify line by 20 metres
-                linepoisimp = processing.run("native:simplifygeometries", {'INPUT': linepoi['OUTPUT'],
-                                                                           'METHOD': '0',
-                                                                           'TOLERANCE': '20',
-                                                                           'OUTPUT': 'memory:'})
-                #QgsProject.instance().addMapLayer(linepoisimp['OUTPUT'])
-                # Extend line so it definitly covers all of the map length
-                linepexte = processing.run("native:extendlines", {'INPUT': linepoisimp['OUTPUT'],
-                                                                  'START_DISTANCE': str(
-                                                                      intersereplelength['OUTPUT'].maximumValue(
-                                                                          insidx)),
-                                                                  'END_DISTANCE': str(
-                                                                      intersereplelength['OUTPUT'].maximumValue(
-                                                                          insidx)),
-                                                                  'OUTPUT': 'memory:'})
-                # Check angle of points, if too high then rerun simplification to straighten line more
-                angcheck = processing.run("native:extractvertices", {'INPUT': linepexte['OUTPUT'],
-                                                                     'OUTPUT': 'memory:'})
-                #
-                tol = 20
-                # Change angles if they are around 360
-                if lpvar[it] == 3 or lpvar[it] == 5:
-                    with edit(angcheck['OUTPUT']):
-                        for f in angcheck['OUTPUT'].getFeatures():
-                            if f['angle'] > 5:
-                                f['angle'] = f['angle'] - 360
-                                angcheck['OUTPUT'].updateFeature(f)
-                # QgsProject.instance().addMapLayer(angcheck['OUTPUT'])
-                idx = angcheck['OUTPUT'].fields().indexFromName('angle')
-                maxang = angcheck['OUTPUT'].maximumValue(idx)
-                minang = angcheck['OUTPUT'].minimumValue(idx)
-                #
-                finang = 0
-                # While angle of points is less than an amount or more than an amount simplify by more.
-                while minang <= angpoin[it] - 5 or maxang >= angpoin[it] + 5:
-                    tol = tol * 1.3
-                    print(tol)
+                    # Lines should be at least 20% of the length of the intersect, or they are probably not real
+                    plinesexp_1000_seleclength = processing.run("qgis:exportaddgeometrycolumns",
+                                                                {'INPUT': plinesexp_1000_selec['OUTPUT'],
+                                                                 'CALC_METHOD': 2,
+                                                                 'OUTPUT': 'memory:'
+                                                                 })
+                    # Sum length of lines
+                    sumllpl = sum(filter(None, [f['length'] for f in plinesexp_1000_seleclength['OUTPUT'].getFeatures()]))
+                    # If the sum length of lines is not more than 20% of the search area then it should not be considered
+                    if sumllpl < intersereplelength['OUTPUT'].maximumValue(insidx) / 5:
+                        finfeat = 0
+                        continue
+                    if debug_layers_add == "yes":
+                        plinesexp_1000_selec['OUTPUT'].setName("DEBUG_selected_lines_more_than_20%_of_side_length")
+                        QgsProject.instance().addMapLayer(plinesexp_1000_selec['OUTPUT'])
+                    #
+                    # Calculate bearing of features so to remove lines that arent going in roughly the right direction
+                    layer_provider = plinesexp_1000_selec['OUTPUT'].dataProvider()
+                    layer_provider.addAttributes([QgsField('angle', QVariant.Double)])
+                    #
+                    plinesexp_1000_selec['OUTPUT'].updateFields()
+                    print(plinesexp_1000_selec['OUTPUT'].fields().names())
+                    #
+                    expression1 = QgsExpression('degrees(azimuth(start_point($geometry), end_point($geometry)))')
+                    context2 = QgsExpressionContext()
+                    context2.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(plinesexp_1000_selec['OUTPUT']))
+                    #
+                    with edit(plinesexp_1000_selec['OUTPUT']):
+                        for f in plinesexp_1000_selec['OUTPUT'].getFeatures():
+                            context2.setFeature(f)
+                            f['angle'] = expression1.evaluate(context2)
+                            plinesexp_1000_selec['OUTPUT'].updateFeature(f)
+                    #
+                    # QgsProject.instance().addMapLayer(plinesexp_1000_selec['OUTPUT'])
+                    # Select only features that are heading in pretty much the correct direction (within 4 degrees of
+                    # exactly vertical or horizontal)
+                    print(xyangll[it])
+                    angttu = (xyangll[it] + 182)
+                    angllu = (xyangll[it] + 178)
+                    if angttu > 360:
+                        angttu = angttu - 360
+                        angllu = angllu - 360
+                        #
+                    print(angllu)
+                    angexp = ('"angle" > ' + str((xyangll[it] - 2)) + ' AND "angle" < ' + str((xyangll[it] + 2))
+                              + '  OR "angle" > ' + str((xyangll[it] + 178)) + ' AND "angle" < ' + str((xyangll[it] + 182))
+                              + ' OR "angle" > ' + str(angllu) + ' AND "angle" < ' + str(angttu))
+                    #
+                    plinesexp_1000_selec['OUTPUT'].selectByExpression(angexp, QgsVectorLayer.SetSelection)
+                    #
+                    plinesexp_ang_selec = processing.run("native:saveselectedfeatures",
+                                                         {'INPUT': plinesexp_1000_selec['OUTPUT'],
+                                                          'OUTPUT': 'memory:'
+                                                          })
+                    #
+                    # How many lines are there in this layer? If none then continue loop
+                    finfeat = plinesexp_ang_selec['OUTPUT'].featureCount()
+                    print('line 831 finfeat of ',finfeat)
+                    if finfeat == 0:
+                        continue
+                    #
+                    # Generate 5 random points on each line
+                    randpoint = processing.run("native:randompointsonlines", {'INPUT': plinesexp_ang_selec['OUTPUT'],
+                                                                              'POINTS_NUMBER': '5',
+                                                                              'OUTPUT': 'memory:'})
+                    #
+                    if debug_layers_add == "yes":
+                        randpoint['OUTPUT'].setName("DEBUG_points_on_selected_lines")
+                        QgsProject.instance().addMapLayer(randpoint['OUTPUT'])
+                    #
+                    # Add coordinates to line
+                    layer_provider = randpoint['OUTPUT'].dataProvider()
+                    layer_provider.addAttributes([QgsField('coord', QVariant.Double)])
+                    #
+                    randpoint['OUTPUT'].updateFields()
+                    print(randpoint['OUTPUT'].fields().names())
+                    #
+                    xory = '$' + lpordco[it]
+                    #
+                    expression1 = QgsExpression(xory)
+                    context2 = QgsExpressionContext()
+                    context2.appendScopes(QgsExpressionContextUtils.globalProjectLayerScopes(randpoint['OUTPUT']))
+                    #
+                    with edit(randpoint['OUTPUT']):
+                        for f in randpoint['OUTPUT'].getFeatures():
+                            context2.setFeature(f)
+                            f['coord'] = round(expression1.evaluate(context2), 2)
+                            randpoint['OUTPUT'].updateFeature(f)
+                    #
+                    # Join random points together with line using coordinates to make sure they are in correct order
+                    # First check QGIS version (as it is slightly different between 3.16 and 3.22)
+                    if float(Qgis.QGIS_VERSION[0:4]) < 3.2:
+                        ordins = 'ORDER_FIELD'
+                        funordins = "qgis:pointstopath"
+                    else:
+                        ordins = 'ORDER_EXPRESSION'
+                        funordins = "native:pointstopath"
+                    #
+                    linepoi = processing.run(funordins,
+                                             {'INPUT': randpoint['OUTPUT'], ordins: 'coord', 'OUTPUT': 'memory:'})
+                    #
+                    if debug_layers_add == "yes":
+                        linepoi['OUTPUT'].setName("DEBUG_joined_points")
+                        QgsProject.instance().addMapLayer(linepoi['OUTPUT'])
+                    #
+                    # Simplify line by 20 metres
                     linepoisimp = processing.run("native:simplifygeometries", {'INPUT': linepoi['OUTPUT'],
                                                                                'METHOD': '0',
-                                                                               'TOLERANCE': str(tol),
+                                                                               'TOLERANCE': '20',
                                                                                'OUTPUT': 'memory:'})
+                    if debug_layers_add == "yes":
+                        linepoisimp['OUTPUT'].setName("DEBUG_line_simplified_20_metres")
+                        QgsProject.instance().addMapLayer(linepoisimp['OUTPUT'])
+                    # Extend line so it definitly covers all of the map length
                     linepexte = processing.run("native:extendlines", {'INPUT': linepoisimp['OUTPUT'],
                                                                       'START_DISTANCE': str(
                                                                           intersereplelength['OUTPUT'].maximumValue(
@@ -920,9 +1264,11 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                                                           intersereplelength['OUTPUT'].maximumValue(
                                                                               insidx)),
                                                                       'OUTPUT': 'memory:'})
-                    # Check new angles
+                    # Check angle of points, if too high then rerun simplification to straighten line more
                     angcheck = processing.run("native:extractvertices", {'INPUT': linepexte['OUTPUT'],
                                                                          'OUTPUT': 'memory:'})
+                    #
+                    tol = 20
                     # Change angles if they are around 360
                     if lpvar[it] == 3 or lpvar[it] == 5:
                         with edit(angcheck['OUTPUT']):
@@ -930,61 +1276,124 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
                                 if f['angle'] > 5:
                                     f['angle'] = f['angle'] - 360
                                     angcheck['OUTPUT'].updateFeature(f)
+                    if debug_layers_add == "yes":
+                        angcheck['OUTPUT'].setName("DEBUG_points_with_high_angle")
+                        QgsProject.instance().addMapLayer(angcheck['OUTPUT'])
                     idx = angcheck['OUTPUT'].fields().indexFromName('angle')
-                    # Find new min and max
                     maxang = angcheck['OUTPUT'].maximumValue(idx)
                     minang = angcheck['OUTPUT'].minimumValue(idx)
-                    # If the points are simlyfied as far as they can go, exit the while loop
-                    finang = angcheck['OUTPUT'].featureCount()
-                    print(finang)
-                    if finang == 2:
-                        break
+                    #
+                    finang = 0
+                    # While angle of points is less than an amount or more than an amount simplify by more.
+                    while minang <= angpoin[it] - 5 or maxang >= angpoin[it] + 5:
+                        tol = tol * 1.3
+                        print(tol)
+                        linepoisimp = processing.run("native:simplifygeometries", {'INPUT': linepoi['OUTPUT'],
+                                                                                   'METHOD': '0',
+                                                                                   'TOLERANCE': str(tol),
+                                                                                   'OUTPUT': 'memory:'})
+                        linepexte = processing.run("native:extendlines", {'INPUT': linepoisimp['OUTPUT'],
+                                                                          'START_DISTANCE': str(
+                                                                              intersereplelength['OUTPUT'].maximumValue(
+                                                                                  insidx)),
+                                                                          'END_DISTANCE': str(
+                                                                              intersereplelength['OUTPUT'].maximumValue(
+                                                                                  insidx)),
+                                                                          'OUTPUT': 'memory:'})
+                        # Check new angles
+                        angcheck = processing.run("native:extractvertices", {'INPUT': linepexte['OUTPUT'],
+                                                                             'OUTPUT': 'memory:'})
+                        # Change angles if they are around 360
+                        if lpvar[it] == 3 or lpvar[it] == 5:
+                            with edit(angcheck['OUTPUT']):
+                                for f in angcheck['OUTPUT'].getFeatures():
+                                    if f['angle'] > 5:
+                                        f['angle'] = f['angle'] - 360
+                                        angcheck['OUTPUT'].updateFeature(f)
+                        idx = angcheck['OUTPUT'].fields().indexFromName('angle')
+                        # Find new min and max
+                        maxang = angcheck['OUTPUT'].maximumValue(idx)
+                        minang = angcheck['OUTPUT'].minimumValue(idx)
+                        # If the points are simlyfied as far as they can go, exit the while loop
+                        finang = angcheck['OUTPUT'].featureCount()
+                        print(finang)
+                        if finang == 2:
+                            break
+                        #
+                    # If there are no features then exit the iteration
+                    if minang <= angpoin[it] - 5 or maxang >= angpoin[it] + 5:
+                        finfeat = 0
+                        continue
 
-                # If there are no features then exit the iteration
-                if minang <= angpoin[it] - 5 or maxang >= angpoin[it] + 5:
-                    finfeat = 0
-                    continue
-                # QgsProject.instance().addMapLayer(linepoisimplength['OUTPUT'])
-                # Line before extension should at least be a third of the distance of the map or it is not correct
-                linepoisimplength = processing.run("qgis:exportaddgeometrycolumns", {'INPUT': linepoisimp['OUTPUT'],
-                                                                                     'CALC_METHOD': 2,
-                                                                                     'OUTPUT': 'memory:'
-                                                                                     })
-                # Sum length of lines
-                sumll = sum(filter(None, [f['length'] for f in linepoisimplength['OUTPUT'].getFeatures()]))
-                # If the sum length of lines is not more than a third of the search area
-                # then it should not be considered and exit the iteration
-                if sumll < intersereplelength['OUTPUT'].maximumValue(insidx) / 3:
-                    finfeat = 0
-                    continue
-                # QgsProject.instance().addMapLayer(angcheck['OUTPUT'])
-                # repeat number if necessary
-                repnum = 1
-            #
-            # If first line of loop then add to finalline polygon
-            if it == 0:
-                finalline = linepexte['OUTPUT']
-            else:  # If other line then merge this line to already created final line
-                laylis = [finalline, linepexte['OUTPUT']]
-                finalline2 = processing.run("native:mergevectorlayers", {'LAYERS': laylis,
-                                                                         'OUTPUT': 'memory:'})
-                finalline = finalline2['OUTPUT']
-
-            if it == 0:
-                feedback.setProgress(int(40))
-                feedback.pushInfo(self.tr('Side 1 of 4 calculated.'))
-            if it == 1:
-                feedback.setProgress(int(50))
-                feedback.pushInfo(self.tr('Side 2 of 4 calculated.'))
-            if it == 2:
-                feedback.setProgress(int(60))
-                feedback.pushInfo(self.tr('Side 3 of 4 calculated.'))
-            if it == 3:
-                feedback.setProgress(int(70))
-                feedback.pushInfo(self.tr('Side 4 of 4 calculated.'))
-
-        #QgsProject.instance().addMapLayer(finalline)
-
+                    # Line before extension should at least be a third of the distance of the map or it is not correct
+                    linepoisimplength = processing.run("qgis:exportaddgeometrycolumns", {'INPUT': linepoisimp['OUTPUT'],
+                                                                                         'CALC_METHOD': 2,
+                                                                                         'OUTPUT': 'memory:'
+                                                                                         })
+                    #
+                    # Sum length of lines
+                    sumll = sum(filter(None, [f['length'] for f in linepoisimplength['OUTPUT'].getFeatures()]))
+                    # If the sum length of lines is not more than a third of the search area
+                    # then it should not be considered and exit the iteration
+                    if sumll < intersereplelength['OUTPUT'].maximumValue(insidx) / 3:
+                        finfeat = 0
+                        continue
+                    # repeat number if necessary
+                    repnum = 1
+                #
+                if debug_layers_add == "yes":
+                    linepexte['OUTPUT'].setName("DEBUG_final_line_points")
+                    QgsProject.instance().addMapLayer(linepexte['OUTPUT'])
+                if finfeat == 0:
+                    if was_auto and quanyy != 3:
+                        quanyy = 3  # fall back to Low, the most permissive fixed level
+                        feedback.pushInfo(
+                            self.tr(f'Could not find line for side {lname[it]}. Retrying with Very Low quality.'))
+                        line_failed = True
+                        break  # break out of the for loop to retry
+                    else:
+                        feedback.pushInfo(self.tr(f'Could not find line for side {lname[it]}. Exiting process.'))
+                        return {self.OUTPUT: ''}
+                #
+                # If first line of loop then add to finalline polygon
+                if it == 0:
+                    finalline = linepexte['OUTPUT']
+                else:  # If other line then merge this line to already created final line
+                    laylis = [finalline, linepexte['OUTPUT']]
+                    finalline2 = processing.run("native:mergevectorlayers", {'LAYERS': laylis,
+                                                                             'OUTPUT': 'memory:'})
+                    finalline = finalline2['OUTPUT']
+                #
+                if it == 0:
+                    feedback.setProgress(int(40))
+                    feedback.pushInfo(self.tr('Side 1 of 4 calculated.'))
+                    # Reset the retry counter from Side 1.
+                    # Side 2 should not inherit Side 1's movement.
+                    ritnum = 0
+                if it == 1:
+                    feedback.setProgress(int(50))
+                    feedback.pushInfo(self.tr('Side 2 of 4 calculated.'))
+                if it == 2:
+                    feedback.setProgress(int(60))
+                    feedback.pushInfo(self.tr('Side 3 of 4 calculated.'))
+                    # Reset the retry counter from Side 3.
+                    # Side 4 should not inherit Side 3's movement.
+                    ritnum = 0
+                if it == 3:
+                    feedback.setProgress(int(70))
+                    feedback.pushInfo(self.tr('Side 4 of 4 calculated.'))
+                #
+                if debug_layers_add == "yes":
+                    linepexte['OUTPUT'].setName("DEBUG_final_side_line")
+                    QgsProject.instance().addMapLayer(linepexte['OUTPUT'])
+                #
+            if not line_failed:
+                success = True  # all 4 sides found, exit the while loop
+        #
+        if debug_layers_add == "yes":
+            finalline.setName("DEBUG_final_all_lines")
+            QgsProject.instance().addMapLayer(finalline)
+        #
         # Change line features to polygon
         polyout = processing.run("qgis:polygonize", {'INPUT': finalline,
                                                      'OUTPUT': 'memory:'})
@@ -1051,7 +1460,27 @@ class SoiMapClipperAlgorithm(QgsProcessingAlgorithm):
         except NameError:
             feedback.pushInfo(self.tr('Not all sides defined. Check if map sheet is correctly georeferenced.'))
         else:
-            iface.addRasterLayer(result, "Clipped " + quna)
+            # 1. Fetch parameter values
+            load_output = self.parameterAsBoolean(parameters, self.LOAD_OUTPUT, context)
+            output_file = self.parameterAsString(parameters, self.OUTPUT, context)
+
+            # 2. Check if the user specified a custom path vs. QGIS default temp path
+            # QGIS temp outputs usually end with "OUTPUT.tif" or sit inside a temp directory
+            is_temp = not output_file or output_file.lower().endswith(
+                "output.tif") or "processing_" in output_file.lower()
+
+            if not is_temp:
+                # User specified their own file path!
+                layer_display_name = os.path.splitext(os.path.basename(output_file))[0]
+            else:
+                layer_display_name = "Temporary Clipped " + original_layer_name + " - " + quna
+            if not output_file:
+                load_output = True  # nothing else will show or keep the result, so load it regardless
+
+            # 3. Add to QGIS Canvas if enabled
+            if load_output:
+                iface.addRasterLayer(result, layer_display_name)
+
             iface.messageBar().pushMessage(
                 "Success - Your map has been clipped!",
                 level=Qgis.Success, duration=3)
